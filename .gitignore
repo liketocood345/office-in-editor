@@ -1,0 +1,17 @@
+node_modules/
+dist/
+out/
+artifacts/
+payload/
+.local/
+.runtime/
+coverage/
+**/bin/
+**/obj/
+*.vsix
+*.pdb
+*.log
+.env
+.env.*
+!.env.example
+.DS_Store

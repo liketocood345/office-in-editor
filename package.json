@@ -1,0 +1,155 @@
+{
+  "name": "office-in-editor",
+  "displayName": "Office in Editor",
+  "description": "A privacy-conscious Office collaboration bridge for VS Code and Cursor. Native Office embedding and local AutoSave redirection are explicitly unsupported.",
+  "version": "0.1.0",
+  "publisher": "liketocood345",
+  "license": "BSD-3-Clause",
+  "private": true,
+  "preview": true,
+  "engines": {
+    "vscode": "^1.125.0"
+  },
+  "extensionKind": [
+    "ui"
+  ],
+  "categories": [
+    "Other",
+    "Machine Learning"
+  ],
+  "keywords": [
+    "office",
+    "word",
+    "excel",
+    "powerpoint",
+    "mcp",
+    "cursor"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/liketocood345/office-in-editor.git"
+  },
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onView:officeInEditor.inbox",
+    "onMcpServerDefinitionProvider:office-in-editor"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "Office control requires a trusted local workspace."
+    },
+    "virtualWorkspaces": {
+      "supported": false
+    }
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "officeInEditor.refresh",
+        "title": "Office: Refresh References"
+      },
+      {
+        "command": "officeInEditor.status",
+        "title": "Office: Show Bridge Status"
+      },
+      {
+        "command": "officeInEditor.diagnostics",
+        "title": "Office: Show Redacted Diagnostics"
+      },
+      {
+        "command": "officeInEditor.openDocument",
+        "title": "Office: Open Document Session"
+      },
+      {
+        "command": "officeInEditor.openInOffice",
+        "title": "Office: Open in Microsoft Office"
+      },
+      {
+        "command": "officeInEditor.listOfficeInstances",
+        "title": "Office: List Connected Applications"
+      },
+      {
+        "command": "officeInEditor.captureSelection",
+        "title": "Office: Capture Current Selection"
+      },
+      {
+        "command": "officeInEditor.listRegisteredChats",
+        "title": "Office: Choose Registered Chat"
+      },
+      {
+        "command": "officeInEditor.deliverReference",
+        "title": "Office: Add Reference to Registered Chat"
+      },
+      {
+        "command": "officeInEditor.releaseReference",
+        "title": "Office: Release Reference"
+      },
+      {
+        "command": "officeInEditor.exportReference",
+        "title": "Office: Export Reference"
+      },
+      {
+        "command": "officeInEditor.showReference",
+        "title": "Office: Show Reference"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "officeInEditor",
+          "title": "Office",
+          "icon": "assets/office-in-editor.svg"
+        }
+      ]
+    },
+    "views": {
+      "officeInEditor": [
+        {
+          "id": "officeInEditor.inbox",
+          "name": "Office References"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "officeInEditor.refresh",
+          "when": "view == officeInEditor.inbox",
+          "group": "navigation"
+        }
+      ]
+    },
+    "mcpServerDefinitionProviders": [
+      {
+        "id": "office-in-editor",
+        "label": "Office in Editor"
+      }
+    ]
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test tests/*.test.mjs packages/adapters/vsix/test/*.test.mjs",
+    "test:integration": "node scripts/test-integration.mjs",
+    "privacy": "node scripts/privacy-scan.mjs",
+    "package:vsix": "npm run build && vsce package --no-dependencies --allow-missing-repository --out artifacts/office-in-editor-0.1.0.vsix",
+    "package:setup": "node scripts/package-setup.mjs",
+    "vscode:prepublish": "node scripts/build-extension.mjs"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "2.4.0",
+    "@modelcontextprotocol/ext-apps": "2.0.4",
+    "@types/node": "24.10.1",
+    "@types/vscode": "1.125.0",
+    "@vscode/test-electron": "3.1.0",
+    "@vscode/vsce": "4.1.1",
+    "esbuild": "0.28.2",
+    "typescript": "5.9.3"
+  },
+  "overrides": {
+    "@vscode/vsce": {
+      "minimatch": "11.0.1"
+    }
+  }
+}
