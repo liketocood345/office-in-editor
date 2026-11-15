@@ -1,5 +1,7 @@
 # Office in Editor 设计手册
 
+窗口移动采用原生 owner 事件驱动，纯平移不得进入 Office COM、重复激活或重新扫描 UIA；尺寸/DPI 变化后通过有界的缓存节点校准收敛。定位失效的显式恢复入口与验证边界见 [窗口跟随修复](WINDOW_FOLLOW_FIX.md)。
+
 **设计目标（优先于实现细节）：标签嵌套覆盖具有合格本地文档服务器的 Office 文件编辑器，含 Word、Excel、PowerPoint，以及满足条件的 Visio、OneNote、Publisher、Project。支持多标签、多应用；30 秒内可交互为性能目标，60 秒为当前交接规定的标签终态硬上限。适配走同一套容器契约，不按 Office 主窗类名逐个打补丁。不含 Outlook、OneDrive 等非文档编辑成员。**
 
 **0.1.4 规范补全（2026-11-15 活测）：** 选择器已扩至七款候选；多会话、每 kind 独立 STA。加载项选区/MCP 仍只分派 Word/Excel/PowerPoint。标签嵌套以 `#ole-root` 令牌矩形为唯一内容区；**打开成功前容器必须保持隐藏**，失败不得留下挡住 IDE 其它区域的 HWND。保存只有一条路径：与功能区保存按钮相同的一次原件 Save；插件只保留**定时保存**，实现为周期静默触发该按钮，取消「编辑后保存」。原生 AutoSave 后端重定向仍未实现。Excel/PPT 的 OLE 创建必须在 STA 上泵消息；无 `IOleDocument`/`IOleInPlaceObject` 的格式（常见于桌面 OneNote）短状态失败，不抢主窗。全系列可交互与关闭取消仍待验收。
@@ -125,8 +127,8 @@ OneNote 现代客户端、仅云笔记本、无 `IOleObject`/`IOleDocument`/`IOl
 
 - 一次打开 **多个** 自定义编辑器标签（同一应用多种文件，或几种应用一起）；
 - **多种** 范围内 Office 同时处于打开中或已嵌套。
-- **同一原件的多个标签共用一份文档对象**。第二个及以后的标签用 `IOleDocumentView.Clone` / `CreateView`，服务器不支持多视图时共用同一 HWND。任一标签里的编辑就是这份文档；禁止为同文件再 `OleCreateFromFile` 或静默复制工作副本。最后一个标签拆除对象。
-- **Office 自定义编辑器不走默认预览「新换旧」**。`vscode.openWith` 用 `{ preview: false }`；标签一出现就 `keepEditor`，并用 `tabGroups.onDidChangeTabs` 把仍为 preview 的 Office 标签转成普通标签。不得改全局 `workbench.editor.enablePreview`。
+- **同一原件的多个标签 / 多个 Cursor 窗口共用一份文档对象**。复制只发生在壳的窗口展示与交互层：每个标签一个容器 HWND，绑同一 `IOleObject`。**禁止**再 `IOleDocumentView.Clone` / `CreateView`（第二视图会抢走先开窗口的原位界面，表现为白屏）。额外窗口一律壳镜像：`PrintWindow` 把主容器 HWND 的画面拷到该标签 HWND，**不转发鼠标/键盘**。禁止为同文件再 `OleCreateFromFile`，禁止静默复制工作副本/从原件分流。最后一个标签拆除对象。
+- **Office 自定义编辑器不走默认预览「新换旧」**。`vscode.openWith` 用 `{ preview: false }`；标签出现时只 `keepEditor` 转成普通标签，**不得** `pinEditor`。并用 `tabGroups.onDidChangeTabs` 把仍为 preview 的 Office 标签转成普通标签。不得改全局 `workbench.editor.enablePreview`。
 
 关闭：
 
@@ -149,7 +151,8 @@ OneNote 现代客户端、仅云笔记本、无 `IOleObject`/`IOleDocument`/`IOl
 - 反向项目（Office 里嵌浏览器）不采用。不把 Electron/VS Code 私有 workbench DOM 当几何来源。允许的嵌套只限于 Core OLE **容器**铺在 `#ole-root` 令牌矩形上（当前 owned `WS_POPUP`；禁止再把容器 `SetParent` 进 Chromium 以免输入队列并入 IDE）。
 - 加载项仍必须能在独立打开的范围内应用、以及 OLE 容器里的对应实例中加载；不在 Office 进程里创建 WinForms `Control` 或托管窗口过程。`OnConnection` 只保存 Application，管道与 Core 注册放到 `OnStartupComplete`。STA 回调用 APC 切回 Office 线程，不建 `HWND_MESSAGE`。新种类若没有 Application 加载项模型，嵌套仍走容器路径，MCP/Ribbon 能力按缺模型缩小。
 - 每个标签一次打开对应 **一条** OLE 会话。会话记住该次原位对象窗口的进程 ID。随后 `office.register` 若 pid 匹配某条嵌入会话，则该实例标为嵌入，接收 MCP 重绑。多种类、多标签可以同时有多条会话；不要用「全局只有一条 HasSession」挡打开。
-- 容器 HWND 先隐藏创建。几何只来自令牌/四角打点的屏幕矩形。禁止 `HWND_TOPMOST`、禁止为对齐去 `SetForegroundWindow`、禁止按其它窗口的宽高做匹配、禁止用 `window.screenX/Y` 把 popup 摆到 IDE 原点或铺满工作区。未 `open_ok` 时窗口保持隐藏；`ShowObject` 也不得在 attach 前把容器亮出来。`GetContainer` 返回自身 `IOleContainer`。按暂存副本 `OleCreateFromFile` 之后 `OleRun`，把 `IOleObject` 赋给站点，**表面已解析且仍隐藏** 时再原位激活，成功后再 Show。Word 会在 `DoVerb` 期间回调 `ActivateMe`，此时必须已经能 `CreateView`。关标签走 `office.detach_window` 只拆除 **该标签** 对应会话。
+- 容器 HWND 先隐藏创建。几何只来自令牌/四角打点的屏幕矩形。禁止 `HWND_TOPMOST`、禁止为对齐去 `SetForegroundWindow`、禁止按其它窗口的宽高做匹配、禁止用 `window.screenX/Y` 把 popup 摆到 IDE 原点或铺满工作区。**第一次**用四角打点解析 IDE owner 与相对边距；之后 `SetWindowPos` 跟 owner 边距走。侧栏等外框不变、编辑区变时，空闲再用 `#ole-root` 的 CSS 尺寸校准（保持左/上边距）。尺寸变了才 `SetRect`。禁止空闲校准再走 UIA 全树 / `uia-token`、禁止 80ms/`PrintWindow` 轮询、禁止每次 layout 改窗口样式或 `UIDeactivate`。
+- 文件名以 `~` 开头的 Office 锁/缓存文件（如 `~$文档.docx`）不得打开；标签内提示「这是 Office 缓存文件，不要打开。」未 `open_ok` 时窗口保持隐藏；`ShowObject` 也不得在 attach 前把容器亮出来。`GetContainer` 返回自身 `IOleContainer`。按暂存副本 `OleCreateFromFile` 之后 `OleRun`，把 `IOleObject` 赋给站点，**表面已解析且仍隐藏** 时再原位激活，成功后再 Show。Word 会在 `DoVerb` 期间回调 `ActivateMe`，此时必须已经能 `CreateView`。关标签走 `office.detach_window` 只拆除 **该标签** 对应会话。
 - **每种** Office 文档服务器一条 STA。该线程在空闲时泵消息（`MsgWaitForMultipleObjects` + `PeekMessage`），**在 `OleCreateFromFile` / `DoVerb` 等阻塞 COM 调用期间也必须泵**（`IMessageFilter.MessagePending`），否则 Excel/PPT 会在调用方 STA 上卡到标签 60 秒上限。不能只在每次 `Invoke` 返回后 `PeekMessage`。不同种类的 STA 互不阻塞。
 - 存在 **任意** 活动 OLE 会话时 Core 不算空闲，不得按 20 秒空闲把容器进程退出。全部会话拆除后才恢复空闲退出。
 

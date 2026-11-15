@@ -14,6 +14,13 @@ internal static class NativeOfficeLauncher
             throw new CoreFault("invalid_path", "Choose an existing local Office document.");
         var fullPath = Path.GetFullPath(path);
         if (!File.Exists(fullPath)) throw new CoreFault("file_not_found", "The selected document is unavailable.");
+        if (Path.GetFileName(fullPath).StartsWith('~'))
+        {
+            // #region agent log
+            DebugNdjson.Write("C", "NativeOfficeLauncher.Open", "office_cache_file", new { hypothesisId = "C1", runId = "post-fix", nameLen = Path.GetFileName(fullPath).Length });
+            // #endregion
+            throw new CoreFault("office_cache_file", "This is an Office cache file and should not be opened.");
+        }
         if (!OfficeDocumentKind.TryClassify(fullPath, out var kind))
             throw new CoreFault("unsupported_format", "This file is not an embeddable Office document.");
         _ = (x, y);

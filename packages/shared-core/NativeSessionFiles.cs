@@ -57,8 +57,19 @@ internal sealed class NativeSessionFiles
             PlainPath(root);
             var sourceVersion = Inspect(source, validateWord: ext == ".docx");
             var directory = Path.Combine(root, "s-" + sessionId[4..].ToLowerInvariant());
-            if (Directory.Exists(directory) || SessionDirectories(root).Count >= SessionLimit)
+            var before = SessionDirectories(root).Count;
+            var reclaimed = ReclaimOrphanSessions(root);
+            var dirCount = SessionDirectories(root).Count;
+            // #region agent log
+            DebugNdjson.Write("R", "NativeSessionFiles.Create", "quota", new { hypothesisId = "H6", runId = "post-fix", before, reclaimed, dirCount, sessionLimit = SessionLimit, exists = Directory.Exists(directory) });
+            // #endregion
+            if (Directory.Exists(directory) || dirCount >= SessionLimit)
+            {
+                // #region agent log
+                DebugNdjson.Write("R", "NativeSessionFiles.Create", "recovery_limit", new { hypothesisId = "H6", runId = "post-fix", exists = Directory.Exists(directory), dirCount });
+                // #endregion
                 throw Fault("recovery_limit", "Native session recovery capacity is full.");
+            }
             string copyFrom = source;
             SourceVersion copyVersion = sourceVersion;
             if (backupId is not null)
@@ -197,6 +208,42 @@ internal sealed class NativeSessionFiles
 
     // The caller must only choose this after Office confirmed a clean close.
     // Failed or dirty closes leave these known files in place for recovery.
+    internal static int ReclaimOrphans(string? dataRoot = null)
+    {
+        var root = LocalPath(dataRoot ?? DefaultRoot);
+        lock (Gate)
+        {
+            if (!Directory.Exists(root)) return 0;
+            PlainPath(root);
+            return ReclaimOrphanSessions(root);
+        }
+    }
+
+    private static int ReclaimOrphanSessions(string root)
+    {
+        var reclaimed = 0;
+        foreach (var directory in SessionDirectories(root).ToArray())
+        {
+            if (ActiveDirectories.Contains(directory)) continue;
+            string[] names;
+            try { names = Directory.EnumerateFiles(directory).Select(Path.GetFileName).Where(name => name is not null).Select(name => name!).ToArray(); }
+            catch { continue; }
+            if (names.Any(name => name.StartsWith("~$", StringComparison.Ordinal)
+                || name.StartsWith("backup-", StringComparison.OrdinalIgnoreCase)
+                || name.StartsWith("previous.", StringComparison.OrdinalIgnoreCase)))
+                continue;
+            try
+            {
+                foreach (var file in Directory.EnumerateFiles(directory).ToArray())
+                    DeleteOwned(root, file);
+                DeleteEmptyDirectory(root, directory);
+                if (!Directory.Exists(directory)) reclaimed++;
+            }
+            catch { /* A locked working copy stays; other orphans can still free a slot. */ }
+        }
+        return reclaimed;
+    }
+
     internal void DisposeClean()
     {
         lock (Gate)

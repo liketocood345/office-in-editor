@@ -80,8 +80,8 @@ export class OfficeBroker {
   openInOffice(
     documentPath: string,
     mode: "external" | "embedded" = "external",
-    options: { fallback?: boolean; x?: number; y?: number; width?: number; height?: number; sessionId?: string; surfaceToken?: string; timeoutMs?: number } = {},
-  ): Promise<{ opened: true; mode: "external" | "embedded"; application: string; pid?: number; inplace?: boolean; officeId?: string; hwnd?: string }> {
+    options: { fallback?: boolean; x?: number; y?: number; width?: number; height?: number; sessionId?: string; surfaceToken?: string; timeoutMs?: number; visible?: boolean; pixelRatio?: number } = {},
+  ): Promise<{ opened: true; mode: "external" | "embedded"; application: string; pid?: number; inplace?: boolean; officeId?: string; hwnd?: string; shared?: boolean; viewMode?: string }> {
     const { timeoutMs = OPEN_DOCUMENT_TIMEOUT_MS, ...payload } = options;
     return this.transport.request("office.open", this.withHost({ path: documentPath, mode, ...payload }), { timeoutMs: Math.max(250, Math.min(timeoutMs, OPEN_DOCUMENT_TIMEOUT_MS)) });
   }

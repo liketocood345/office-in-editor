@@ -28,6 +28,7 @@ export interface HostBounds {
   height: number;
   visible?: boolean;
   surfaceToken?: string;
+  pixelRatio?: number;
 }
 
 export interface OfficeInstance {

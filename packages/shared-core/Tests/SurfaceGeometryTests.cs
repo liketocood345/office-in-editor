@@ -32,6 +32,16 @@ internal static class SurfaceGeometryTests
         check(WebviewSurface.ContainsBounds(owner, rectangle)
             && !WebviewSurface.ContainsBounds(new(0, 0, 1920, 1080), rectangle),
             "a token rectangle is constrained to its own IDE window");
+        WebviewSurface.ReadOwnerInsets(owner, rectangle, out var insetL, out var insetT, out var insetR, out var insetB);
+        check(insetL == 120 && insetT == 120 && insetR == 600 && insetB == 60
+            && WebviewSurface.ApplyOwnerInsets(new(0, 40, 1920, 1080), insetL, insetT, insetR, insetB)
+                == new WebviewSurface.ScreenBounds(120, 160, 1200, 900),
+            "owner-inset follow preserves the beacon rectangle when the IDE window moves or resizes");
+        check(WebviewSurface.PhysicalFromCss(1107, 1) == 1107 && WebviewSurface.PhysicalFromCss(800, 1.5) == 1200,
+            "CSS idle mapping uses the reported pixel ratio");
+        check(WebviewSurface.TryCssIdleNested(new(0, 0, 1935, 1056), 222, 110, 807, 853, 1, out var cssIdle)
+            && cssIdle == new WebviewSurface.ScreenBounds(222, 110, 807, 853),
+            "CSS idle keeps beacon left/top insets when the editor pane shrinks inside an unchanged owner");
         check(WebviewSurface.IsTrustedHow("uia-beacon-corners-cache")
             && !WebviewSurface.IsTrustedHow("webview-size-match")
             && !WebviewSurface.IsTrustedHow("uia-js-fallback"),

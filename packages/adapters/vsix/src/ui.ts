@@ -55,11 +55,11 @@ export function hostHtml(
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}'; base-uri 'none'; form-action 'none'">
 <title>${token}</title>
 <style nonce="${nonce}">
-html,body,#ole-root{margin:0;height:100%;width:100%;overflow:hidden;background:${background};color:${foreground}}
+html,body,#ole-root{margin:0;height:100%;width:100%;min-height:100%;min-width:100%;overflow:hidden;background:${background}!important;color:${foreground}}
 #ole-root{position:absolute;inset:0}
 .host-status{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;padding:24px;text-align:center;color:${foreground};font-family:var(--vscode-font-family)}
 .host-ready{position:absolute;inset:0}
-.oie-beacon{position:absolute;width:1px;height:1px;padding:0;margin:0;border:0;border-radius:0;pointer-events:none;z-index:3;background:#000}
+.oie-beacon{position:absolute;width:1px;height:1px;padding:0;margin:0;border:0;border-radius:0;pointer-events:none;z-index:3;background:${background}}
 .oie-beacon[data-oie-beacon="tl"]{left:0;top:0}
 .oie-beacon[data-oie-beacon="tr"]{right:0;top:0}
 .oie-beacon[data-oie-beacon="bl"]{left:0;bottom:0}
@@ -106,12 +106,19 @@ window.addEventListener('message',event=>{
     surface.hidden=false;
   }
 });
+let reportQueued=false;
 function report(){
-  const viewport=window.visualViewport;
-  const width=Math.round((viewport&&viewport.width)||window.innerWidth||0);
-  const height=Math.round((viewport&&viewport.height)||window.innerHeight||0);
-  const dpr=window.devicePixelRatio||1;
-  api.postMessage({action:'layout',surfaceToken,width,height,x:0,y:0,dpr,clientOnly:true});
+  if(reportQueued) return;
+  reportQueued=true;
+  requestAnimationFrame(()=>{
+    reportQueued=false;
+    const box=root&&root.getBoundingClientRect?root.getBoundingClientRect():null;
+    const width=Math.round((box&&box.width)||window.innerWidth||0);
+    const height=Math.round((box&&box.height)||window.innerHeight||0);
+    const dpr=window.devicePixelRatio||1;
+    const viewport=window.visualViewport;
+    api.postMessage({action:'layout',surfaceToken,width,height,x:0,y:0,dpr,clientOnly:true,innerW:Math.round(window.innerWidth||0),innerH:Math.round(window.innerHeight||0),vvW:viewport?Math.round(viewport.width):0,vvH:viewport?Math.round(viewport.height):0,vvScale:viewport?viewport.scale:1});
+  });
 }
 window.addEventListener('resize',report);
 new ResizeObserver(report).observe(document.body);

@@ -67,6 +67,10 @@
         "title": "Office: Open in Microsoft Office"
       },
       {
+        "command": "officeInEditor.realignWindow",
+        "title": "Office: Re-align Embedded Window"
+      },
+      {
         "command": "officeInEditor.listOfficeInstances",
         "title": "Office: List Connected Applications"
       },

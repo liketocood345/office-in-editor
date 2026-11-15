@@ -19,11 +19,12 @@ const ui = await import("data:text/javascript;base64," + Buffer.from(uiBuild.out
 
 test("webview boot reports ready and geometry without global collisions; ACK stops retries", () => {
   const messages = [], timers = [], listeners = {};
-  const nodes = Object.fromEntries(["status", "surface", "ole-root"].map(id => [id, { hidden: true, addEventListener() {} }]));
+  const nodes = Object.fromEntries(["status", "surface", "ole-root"].map(id => [id, { hidden: true, addEventListener() {}, getBoundingClientRect: () => ({ width: 900, height: 600 }) }]));
   const context = createContext({
     acquireVsCodeApi: () => ({ postMessage: value => messages.push(value) }),
     document: { getElementById: id => nodes[id], body: {}, title: "" },
-    window: { innerWidth: 900, innerHeight: 600, addEventListener: (name, handler) => { listeners[name] = handler; } },
+    window: { innerWidth: 900, innerHeight: 600, devicePixelRatio: 1, addEventListener: (name, handler) => { listeners[name] = handler; } },
+    requestAnimationFrame: callback => callback(),
     ResizeObserver: class { observe() {} }, setTimeout: callback => timers.push(callback),
   });
   runInContext("const status = 'existing browser binding';", context);
@@ -38,7 +39,8 @@ test("webview boot reports ready and geometry without global collisions; ACK sto
   assert.equal(html.includes("ole-root"), true);
   assert.equal(html.includes("oie-beacon"), true);
   assert.equal(html.includes("width:1px"), true);
-  assert.equal(html.includes("background:#000"), true);
+  assert.equal(html.includes("background:#000"), false);
+  assert.equal(html.includes("background:#FFFFFF"), true);
   assert.equal(html.includes(surfaceToken + ":tl"), true);
   assert.equal(html.includes("oie-surface-label"), false);
   assert.equal(html.includes("open-external"), false);

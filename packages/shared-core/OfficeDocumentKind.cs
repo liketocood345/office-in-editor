@@ -63,7 +63,13 @@ internal sealed class OfficeDocumentKind
                 return false;
             if (clsid == Guid.Empty)
             {
-                foreach (var candidate in new[] { guessedProg, guessedProg + ".12", guessedProg + ".8" })
+                var candidates = new List<string> { guessedProg, guessedProg + ".1", guessedProg + ".12", guessedProg + ".8" };
+                if (guessedApp == "onenote")
+                {
+                    candidates.Insert(0, "OneNote.Notebook");
+                    candidates.Insert(1, "OneNote.Notebook.1");
+                }
+                foreach (var candidate in candidates)
                 {
                     if (CLSIDFromProgID(candidate, out var fromProg) != 0 || fromProg == Guid.Empty) continue;
                     clsid = fromProg;
@@ -108,7 +114,7 @@ internal sealed class OfficeDocumentKind
             ".xlsx" or ".xls" or ".xlsm" or ".xlsb" or ".xltx" or ".xltm" or ".csv" => ("excel", "Excel.Sheet", "EXCEL.EXE"),
             ".pptx" or ".ppt" or ".pptm" or ".potx" or ".potm" or ".ppsx" => ("powerpoint", "PowerPoint.Show", "POWERPNT.EXE"),
             ".vsdx" or ".vsd" or ".vstx" or ".vssx" or ".vstm" => ("visio", "Visio.Drawing", "VISIO.EXE"),
-            ".one" or ".onepkg" => ("onenote", "OneNote.Section", "ONENOTE.EXE"),
+            ".one" or ".onepkg" => ("onenote", "OneNote.Notebook", "ONENOTE.EXE"),
             ".pub" => ("publisher", "Publisher.Document", "MSPUB.EXE"),
             ".mpp" => ("project", "MSProject.Project", "WINPROJ.EXE"),
             _ => ("", "", "")

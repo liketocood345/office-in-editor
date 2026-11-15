@@ -73,6 +73,7 @@ public sealed partial class CoreState : IAsyncDisposable
                     BecameIdle?.Invoke();
         });
         LoadReferences();
+        try { NativeSessionFiles.ReclaimOrphans(); } catch { /* Startup must not fail because leftover staging exists. */ }
     }
     private bool NoPersistentWork() =>
         hosts.Count == 0 && offices.Count == 0 && chats.Count == 0 && runtimeOwners.Count == 0 && !OleDocumentHost.HasSession;

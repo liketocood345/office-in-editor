@@ -40,7 +40,7 @@ foreach($name in @('installation-common.ps1','install-office.ps1','uninstall-off
   $plan.Add([ordered]@{relativePath='maintenance/'+$name;sha256=(Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant();source=$source})
 }
 if(-not $SkipEditors){
-  if(-not $VsixPath){$candidate=Get-ChildItem -LiteralPath (Join-Path $PSScriptRoot '..\artifacts') -Filter '*.vsix' -File -ErrorAction SilentlyContinue|Select-Object -First 1;if($candidate){$VsixPath=$candidate.FullName}}
+  if(-not $VsixPath){$candidate=Get-ChildItem -LiteralPath (Join-Path $PSScriptRoot '..\artifacts') -Filter '*.vsix' -File -ErrorAction SilentlyContinue|Sort-Object LastWriteTime -Descending|Select-Object -First 1;if($candidate){$VsixPath=$candidate.FullName}}
   if(-not $VsixPath -or -not(Test-Path -LiteralPath $VsixPath)){throw 'Build the VSIX before installing editor adapters.'}
   Assert-OieSafePath $VsixPath
 }

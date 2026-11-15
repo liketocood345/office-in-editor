@@ -26,6 +26,10 @@ const DOCUMENT_EXTENSIONS = new Set([
   ".pub", ".mpp",
 ]);
 
+function isOfficeCacheFile(fsPath: string): boolean {
+  return path.basename(fsPath).startsWith("~");
+}
+
 function assertLocalAccess(): void {
   if (process.platform !== "win32") throw new OfficeBridgeError("UNSUPPORTED_PLATFORM");
   if (vscode.env.remoteName) throw new OfficeBridgeError("REMOTE_NOT_SUPPORTED");
@@ -69,6 +73,7 @@ async function validateLocalDocument(uri: vscode.Uri): Promise<void> {
     || !DOCUMENT_EXTENSIONS.has(path.extname(uri.fsPath).toLowerCase())) {
     throw new OfficeBridgeError("INVALID_DOCUMENT");
   }
+  if (isOfficeCacheFile(uri.fsPath)) throw new OfficeBridgeError("office_cache_file");
   try {
     if (!(await stat(uri.fsPath)).isFile()) throw new OfficeBridgeError("INVALID_DOCUMENT");
   } catch { throw new OfficeBridgeError("INVALID_DOCUMENT"); }
@@ -83,6 +88,7 @@ class OfficeExtension implements vscode.Disposable {
   private readonly hostId = hostKind() + ":" + randomUUID();
   private readonly panels = new Map<string, vscode.WebviewPanel>();
   private readonly officeClosers = new Set<() => Promise<void>>();
+  private readonly officeAligners = new Map<string, { panel: vscode.WebviewPanel; realign: () => Promise<void> }>();
   private traceEvents = 0;
   private loading?: { stage: string; elapsedMs: number };
   private readonly view: vscode.TreeView<import("./tree").InboxNode>;
@@ -116,6 +122,7 @@ class OfficeExtension implements vscode.Disposable {
       diagnostics: () => this.showDiagnostics(),
       openDocument: argument => this.openDocument(argument),
       openInOffice: argument => this.openInOffice(argument),
+      realignWindow: () => this.realignOfficeWindow(),
       listOfficeInstances: () => this.listOfficeInstances(),
       captureSelection: argument => this.captureSelection(argument),
       listRegisteredChats: () => this.listRegisteredChats(),
@@ -231,55 +238,64 @@ class OfficeExtension implements vscode.Disposable {
   private async presentInChat(documentName: string, text: string): Promise<boolean> {
     const query = documentName + "\n\n" + text;
     const cursor = hostKind() === "cursor";
-    const attempts: Array<[string, unknown]> = cursor
-      ? [
-        ["composer.startComposerPrompt", query],
-        ["composer.startComposerPrompt2", query],
-        ["composer.startComposerPrompt", { prompt: query, sendImmediately: false }],
-        ["workbench.action.chat.open", { query, isPartialQuery: true }],
-      ]
-      : [
-        ["workbench.action.chat.open", { query, isPartialQuery: true }],
-        ["workbench.action.chat.open", { query }],
-        ["composer.startComposerPrompt", query],
-      ];
     let placed = false;
-    for (const [command, argument] of attempts) {
-      try {
-        await vscode.commands.executeCommand(command, argument);
-        placed = true;
-        // #region agent log
-        fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "C", location: "extension.ts:presentInChat", message: "command_ok", data: { command, cursor, shape: typeof argument, textLength: text.length }, timestamp: Date.now() }) }).catch(() => {});
-        // #endregion
-        break;
-      } catch (error) {
-        // #region agent log
-        fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "C", location: "extension.ts:presentInChat", message: "command_fail", data: { command, cursor, error: error instanceof Error ? error.message : "unknown" }, timestamp: Date.now() }) }).catch(() => {});
-        // #endregion
-      }
-    }
+    let used = "";
+    // #region agent log
+    fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "H-chat1", location: "extension.ts:presentInChat", message: "present_begin", data: { cursor, skipStartPrompt: true, exactResource: true, neverClose: cursor, textLength: text.length }, timestamp: Date.now() }) }).catch(() => {});
+    // #endregion
     try {
       await vscode.workspace.fs.createDirectory(this.context.globalStorageUri);
-      const file = vscode.Uri.joinPath(this.context.globalStorageUri, "oie-chat-ref.md");
+      const file = vscode.Uri.file(vscode.Uri.joinPath(this.context.globalStorageUri, "oie-chat-ref.md").fsPath);
       await vscode.workspace.fs.writeFile(file, new TextEncoder().encode(query));
+      if (cursor) {
+        try {
+          await vscode.commands.executeCommand("composer.startComposerPrompt", { neverClose: true });
+          // #region agent log
+          fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "H-chat1", location: "extension.ts:presentInChat", message: "never_close_ok", data: { textLength: text.length }, timestamp: Date.now() }) }).catch(() => {});
+          // #endregion
+        } catch (error) {
+          // #region agent log
+          fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "H-chat1", location: "extension.ts:presentInChat", message: "never_close_fail", data: { error: error instanceof Error ? error.message : "unknown" }, timestamp: Date.now() }) }).catch(() => {});
+          // #endregion
+        }
+      }
       try {
-        await vscode.commands.executeCommand("composer.addfilestocomposer", file);
+        await vscode.commands.executeCommand("composer.addfilestocomposer", file, { useExactResource: true });
         placed = true;
+        used = "addfile-exact";
         // #region agent log
-        fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "C", location: "extension.ts:presentInChat", message: "addfile_ok", data: { as: "uri", textLength: text.length }, timestamp: Date.now() }) }).catch(() => {});
+        fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "H-chat1", location: "extension.ts:presentInChat", message: "addfile_ok", data: { as: "exact", textLength: text.length, skipStartPrompt: true }, timestamp: Date.now() }) }).catch(() => {});
         // #endregion
       } catch {
-        await vscode.commands.executeCommand("composer.addfilestocomposer", [file]);
+        await vscode.commands.executeCommand("composer.addfilestocomposer", file);
         placed = true;
+        used = "addfile-uri";
         // #region agent log
-        fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "C", location: "extension.ts:presentInChat", message: "addfile_ok", data: { as: "array", textLength: text.length }, timestamp: Date.now() }) }).catch(() => {});
+        fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "H-chat1", location: "extension.ts:presentInChat", message: "addfile_ok", data: { as: "uri", textLength: text.length, skipStartPrompt: true }, timestamp: Date.now() }) }).catch(() => {});
         // #endregion
       }
     } catch (error) {
       // #region agent log
-      fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "C", location: "extension.ts:presentInChat", message: "addfile_fail", data: { error: error instanceof Error ? error.message : "unknown" }, timestamp: Date.now() }) }).catch(() => {});
+      fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "H-chat1", location: "extension.ts:presentInChat", message: "addfile_fail", data: { error: error instanceof Error ? error.message : "unknown" }, timestamp: Date.now() }) }).catch(() => {});
       // #endregion
     }
+    if (!cursor && !placed) {
+      try {
+        await vscode.commands.executeCommand("workbench.action.chat.open", { query, isPartialQuery: true });
+        placed = true;
+        used = "chat.open";
+        // #region agent log
+        fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "H-chat1", location: "extension.ts:presentInChat", message: "command_ok", data: { command: "workbench.action.chat.open", cursor, shape: "partial", textLength: text.length }, timestamp: Date.now() }) }).catch(() => {});
+        // #endregion
+      } catch (error) {
+        // #region agent log
+        fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "H-chat1", location: "extension.ts:presentInChat", message: "command_fail", data: { command: "workbench.action.chat.open", cursor, error: error instanceof Error ? error.message : "unknown" }, timestamp: Date.now() }) }).catch(() => {});
+        // #endregion
+      }
+    }
+    // #region agent log
+    fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "H-chat1", location: "extension.ts:presentInChat", message: "present_done", data: { placed, used, cursor, skipStartPrompt: true, textLength: text.length }, timestamp: Date.now() }) }).catch(() => {});
+    // #endregion
     return placed;
   }
 
@@ -389,6 +405,13 @@ class OfficeExtension implements vscode.Disposable {
   private async hostDocument(uri: vscode.Uri, panel: vscode.WebviewPanel): Promise<void> {
     panel.webview.options = { enableScripts: true, localResourceRoots: [] };
     const name = displayText(path.basename(uri.fsPath));
+    if (isOfficeCacheFile(uri.fsPath)) {
+      panel.webview.html = hostHtml(name, "这是 Office 缓存文件，不要打开。", "", officeTabAppearance());
+      // #region agent log
+      fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "C1", location: "extension.ts:hostDocument", message: "office_cache_file", data: { nameLen: name.length }, timestamp: Date.now() }) }).catch(() => {});
+      // #endregion
+      return;
+    }
     const sessionId = "ole-" + randomUUID().replaceAll("-", "");
     const started = performance.now();
     const trace = (stage: string): void => {
@@ -405,6 +428,11 @@ class OfficeExtension implements vscode.Disposable {
     let bounds: import("../../../adapter-sdk/src").HostBounds | undefined;
     let layoutRunning = false;
     let layoutVersion = 0;
+    this.officeAligners.set(sessionId, { panel, realign: async () => {
+      if (!officeId || closed || !bounds) throw new OfficeBridgeError("OFFICE_NOT_FOUND");
+      await this.broker.attachOfficeWindow(officeId, { ...bounds, visible: panel.visible });
+    } });
+    let lastLayoutKey = "";
     const layout = async (message?: unknown): Promise<void> => {
       const next = tryHostBounds(message ?? bounds, bounds);
       if (!next) return;
@@ -426,6 +454,7 @@ class OfficeExtension implements vscode.Disposable {
       closed = true;
       attached = false;
       this.officeClosers.delete(close);
+      this.officeAligners.delete(sessionId);
       if (officeId && bounds) {
         try { await this.broker.layoutOfficeWindow(officeId, { ...bounds, visible: false }); }
         catch { /* Hide is best-effort; detach still destroys the HWND. */ }
@@ -444,10 +473,18 @@ class OfficeExtension implements vscode.Disposable {
           trace("geometry_received");
           const first = tryHostBounds(message);
           // #region agent log
-          fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "D", location: "extension.ts:layout", message: "geometry_received", data: { width: first?.width, height: first?.height, x: first?.x, y: first?.y, tokenLen: first?.surfaceToken?.length ?? 0, hasToken: Boolean(first?.surfaceToken) }, timestamp: Date.now() }) }).catch(() => {});
+          fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "T1", location: "extension.ts:layout", message: "geometry_received", data: { width: first?.width, height: first?.height, x: first?.x, y: first?.y, tokenLen: first?.surfaceToken?.length ?? 0, hasToken: Boolean(first?.surfaceToken), elapsedMs: Math.round(performance.now() - started) }, timestamp: Date.now() }) }).catch(() => {});
           // #endregion
         }
         void panel.webview.postMessage({ kind: "layout-ack" });
+        const sized = tryHostBounds(message, bounds);
+        const layoutKey = sized ? sized.width + "x" + sized.height : "";
+        if (sized && layoutKey !== lastLayoutKey) {
+          lastLayoutKey = layoutKey;
+          // #region agent log
+          fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "G2", location: "extension.ts:layout", message: "layout_size", data: { w: sized.width, h: sized.height, dpr: sized.pixelRatio ?? message.dpr, innerW: message.innerW, vvW: message.vvW, vvScale: message.vvScale, source: "ole-root" }, timestamp: Date.now() }) }).catch(() => {});
+          // #endregion
+        }
         void this.run(() => layout(message), false);
       }
       if (isRecord(message) && message.action === "ready") trace("webview_ready");
@@ -461,9 +498,8 @@ class OfficeExtension implements vscode.Disposable {
       try {
         if (panel.active) {
           await vscode.commands.executeCommand("workbench.action.keepEditor");
-          await vscode.commands.executeCommand("workbench.action.pinEditor");
         }
-      } catch { /* Pinning is best-effort against preview replacement. */ }
+      } catch { /* keepEditor is best-effort against preview replacement; do not pin. */ }
       const after = tabOf();
       // #region agent log
       fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "B", location: "extension.ts:keepOfficeTab", message: "tab_keep", data: { panelActive: panel.active, panelVisible: panel.visible, beforePreview: before?.isPreview ?? null, beforePinned: before?.isPinned ?? null, afterPreview: after?.isPreview ?? null, afterPinned: after?.isPinned ?? null }, timestamp: Date.now() }) }).catch(() => {});
@@ -523,7 +559,7 @@ class OfficeExtension implements vscode.Disposable {
         if (remaining < 250) throw new OfficeBridgeError("HOST_WINDOW_UNAVAILABLE");
         trace("office_open_started");
         // #region agent log
-        fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "F", location: "extension.ts:office_open", message: "embedded_request", data: { fallback: false, remainingMs: Math.round(remaining), visible: panel.visible, ...bounds }, timestamp: Date.now() }) }).catch(() => {});
+        fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "T1", location: "extension.ts:office_open", message: "embedded_request", data: { fallback: false, remainingMs: Math.round(remaining), visible: panel.visible, elapsedMs: Math.round(performance.now() - started), ...bounds }, timestamp: Date.now() }) }).catch(() => {});
         // #endregion
         opened = await broker.openInOffice(uri.fsPath, "embedded", { fallback: false, ...bounds, visible: panel.visible, sessionId, timeoutMs: remaining });
         trace("office_open_completed");
@@ -549,7 +585,7 @@ class OfficeExtension implements vscode.Disposable {
       }
       officeId = opened.officeId;
       // #region agent log
-      fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "A", location: "extension.ts:attached", message: "embedded_opened", data: { mode: opened.mode, inplace: opened.inplace, application: opened.application, elapsedMs: Math.round(performance.now() - started) }, timestamp: Date.now() }) }).catch(() => {});
+      fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "T1", location: "extension.ts:attached", message: "embedded_opened", data: { mode: opened.mode, inplace: opened.inplace, application: opened.application, elapsedMs: Math.round(performance.now() - started), loading: this.loading, shared: opened.shared === true, viewMode: opened.viewMode }, timestamp: Date.now() }) }).catch(() => {});
       // #endregion
       if (closed || this.disposed) { await broker.detachOfficeWindow(officeId); return; }
       await layout(bounds);
@@ -557,6 +593,12 @@ class OfficeExtension implements vscode.Disposable {
       await keepOfficeTab();
       trace("attached");
     }, false);
+  }
+
+  private async realignOfficeWindow(): Promise<void> {
+    const active = [...this.officeAligners.values()].find(entry => entry.panel.active);
+    if (!active) return;
+    await active.realign();
   }
 
   private async openInOffice(argument?: unknown): Promise<void> {

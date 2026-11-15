@@ -20,12 +20,17 @@ export function tryHostBounds(message: unknown, fallback?: HostBounds): HostBoun
   if (!token || width == null || height == null || width < 32 || height < 32) {
     return undefined;
   }
+  const scale = record.dpr ?? record.pixelRatio;
+  const pixelRatio = typeof scale === "number" && Number.isFinite(scale) && scale >= 0.5 && scale <= 8
+    ? scale
+    : fallback?.pixelRatio;
   return {
     x: integer(record.x) ?? fallback?.x ?? 0,
     y: integer(record.y) ?? fallback?.y ?? 0,
     width,
     height,
     surfaceToken: token,
+    pixelRatio,
   };
 }
 

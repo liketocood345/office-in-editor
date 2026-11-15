@@ -46,6 +46,9 @@ try
     Check(WebviewSurface.ToClient(100, 80, 860, 916, 7, 40) == (93, 40, 860, 916), "nested child coords are relative to the webview parent client origin");
     Check(!WebviewSurface.IsEditorWebview(IntPtr.Zero) && !WebviewSurface.IsTightEditorHost(new WebviewSurface.Placement(IntPtr.Zero, 214, 102, 860, 916, "uia-mapped")), "workbench-sized mapped parents are not a tight editor webview");
     Check(WebviewSurface.TryBounds(new double[] { 10, 20, 400, 300 }, out var bx, out var by, out var bw, out var bh) && bx == 10 && by == 20 && bw == 400 && bh == 300, "uia bounds arrays are left,top,width,height");
+    SurfaceGeometryTests.Run(Check);
+    NativeOwnerTrackerTests.Run(Check);
+    if (args.Contains("--native-owner-smoke", StringComparer.Ordinal)) NativeOwnerTrackerTests.RunNative(Check);
     var uia = UiaCom.Create();
     Console.WriteLine("UIA create hr=0x" + UiaCom.LastCreateHr.ToString("X8") + " how=" + UiaCom.LastCreateHow + " obj=" + (uia is not null));
     Check(uia is not null && UiaCom.LastCreateHr == 0, "CUIAutomation coclass can be created");
