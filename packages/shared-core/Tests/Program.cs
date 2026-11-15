@@ -63,6 +63,7 @@ try
 
     var host = await Call("host.register", Wire.Node(new { hostId = "test-host", kind = "vscode", label = "Test host" }));
     Check((await Call("host.list"))?.AsArray().Count == 1, "host registration");
+    Check((await Call("chat.defaultTarget"))?["hostId"]?.GetValue<string>() == "test-host", "host register exposes a composer chat");
     await Fault(async () => { await Call("host.unregister", Wire.Node(new { hostId = "test-host", lease = "wrong" })); }, "unauthorized");
     var target = await Call("chat.register", Wire.Node(new { ownerId = "test-owner", hostId = "test-host", label = "Test chat" }));
     var targetId = target!["id"]!.GetValue<string>(); var token = target["token"]!.GetValue<string>();

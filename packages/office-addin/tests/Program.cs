@@ -69,6 +69,9 @@ public static class Program
             wordMenus.Add((string)menu.Attribute("idMso"));
         Assert(wordMenus.Count == 1 && wordMenus[0] == "ContextMenuText");
         Assert(RibbonMarkup.Build("word").Contains("OieTab"));
+        Assert(RibbonMarkup.Build("word").Contains("OieSaveOnClose"));
+        Assert(RibbonMarkup.Build("word").Contains("关标签保存"));
+        Assert(RibbonMarkup.Build("excel").Contains("OieSaveOnClose"));
         Assert(!RibbonMarkup.Build("word").Contains("ContextMenuHeading"));
         var addin = new OfficeAddin();
         var fallback = addin.GetCustomUI(null);

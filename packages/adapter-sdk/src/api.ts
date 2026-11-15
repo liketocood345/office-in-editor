@@ -107,7 +107,7 @@ export class OfficeBroker {
   }
 
   detachOfficeWindow(officeId: string): Promise<{ attached: false }> {
-    return this.transport.request("office.detach_window", this.withHost({ officeId }), { ensureBroker: false, timeoutMs: 1_500 });
+    return this.transport.request("office.detach_window", this.withHost({ officeId }), { ensureBroker: false, timeoutMs: 8_000 });
   }
 
   async dashboard(): Promise<DashboardSnapshot> {

@@ -188,7 +188,11 @@ internal static class DebugNdjson
     private static readonly object Gate = new();
     private static readonly Queue<object> Events = new();
     private static readonly System.Net.Http.HttpClient Http = new() { Timeout = TimeSpan.FromMilliseconds(250) };
-    private const string Ingest = "http://127.0.0.1:7884/ingest/93344ccb-bd6f-4fa7-8e2d-f58c925f8e0b";
+    private static readonly string[] Ingest =
+    [
+        "http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093",
+        "http://127.0.0.1:7884/ingest/93344ccb-bd6f-4fa7-8e2d-f58c925f8e0b"
+    ];
 
     internal static void Write(string hypothesisId, string location, string message, object? data)
     {
@@ -204,12 +208,15 @@ internal static class DebugNdjson
                 data,
                 timestamp
             });
-            var request = new System.Net.Http.HttpRequestMessage(System.Net.Http.HttpMethod.Post, Ingest)
+            foreach (var url in Ingest)
             {
-                Content = new System.Net.Http.StringContent(line, Encoding.UTF8, "application/json")
-            };
-            request.Headers.TryAddWithoutValidation("X-Debug-Session-Id", "4dd893");
-            _ = Http.SendAsync(request);
+                var request = new System.Net.Http.HttpRequestMessage(System.Net.Http.HttpMethod.Post, url)
+                {
+                    Content = new System.Net.Http.StringContent(line, Encoding.UTF8, "application/json")
+                };
+                request.Headers.TryAddWithoutValidation("X-Debug-Session-Id", "4dd893");
+                _ = Http.SendAsync(request);
+            }
         }
         catch { /* Debug ingest must never block Office. */ }
         if (!AppContext.TryGetSwitch("OfficeInEditor.Diagnostics", out var enabled) || !enabled) return;

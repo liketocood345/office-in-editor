@@ -254,6 +254,7 @@ public sealed partial class CoreState : IAsyncDisposable
         var owner = NewOwner(pid, () => RemoveHost(id, lease));
         if (hosts.Remove(id, out var old)) old.Owner.Dispose();
         hosts[id] = new Host { Id = id, Kind = kind, Label = Wire.Text(value, "label", 160), Lease = lease, Epoch = epoch, Owner = owner };
+        EnsureHostComposerChat(hosts[id], pid);
         return Wire.Node(new { hostId = id, lease, epoch });
     }
     private void RemoveHost(string id, string? lease = null)
@@ -264,6 +265,28 @@ public sealed partial class CoreState : IAsyncDisposable
         host.Owner.Dispose();
         foreach (var session in sessionOwners.Where(item => item.Value.HostId == id).ToArray()) ForgetSession(session.Key);
         foreach (var chat in chats.Values.Where(item => item.HostId == id).ToArray()) RemoveChat(chat.Id);
+    }
+    private void EnsureHostComposerChat(Host host, int pid)
+    {
+        var ownerId = "host:" + host.Id;
+        if (chats.Values.Any(item => item.HostId == host.Id && item.OwnerId == ownerId)) return;
+        if (chats.Count >= 32) return;
+        var id = Guid.NewGuid().ToString("N");
+        var chat = new Chat
+        {
+            Id = id,
+            OwnerId = ownerId,
+            Label = string.IsNullOrEmpty(host.Label) ? "Editor chat" : host.Label,
+            HostId = host.Id,
+            Epoch = Guid.NewGuid().ToString("N"),
+            Token = Wire.NewToken(),
+            Owner = NewOwner(pid, () => RemoveChat(id))
+        };
+        chats.Add(id, chat);
+        MarkActivity(chat);
+        // #region agent log
+        DebugNdjson.Write("C", "CoreState.RegisterHost", "host_composer_chat", new { hostId = host.Id, kind = host.Kind });
+        // #endregion
     }
     private JsonNode? UnregisterHost(JsonNode? value)
     {
@@ -466,13 +489,22 @@ public sealed partial class CoreState : IAsyncDisposable
     }
     private void NotifyHost(Chat target, Delivery delivery, string refId)
     {
-        if (target.HostId.Length == 0 || !hosts.TryGetValue(target.HostId, out var host)) return;
+        if (target.HostId.Length == 0 || !hosts.TryGetValue(target.HostId, out var host))
+        {
+            // #region agent log
+            DebugNdjson.Write("C", "CoreState.NotifyHost", "delivery_skip", new { hasHostId = target.HostId.Length > 0, hostKnown = target.HostId.Length > 0 && hosts.ContainsKey(target.HostId) });
+            // #endregion
+            return;
+        }
         var reference = GetReference(refId);
         static string Field(JsonObject selection, string key, int max)
         {
             var text = selection[key] is JsonValue scalar && scalar.TryGetValue<string>(out var value) ? value : "";
             return text.Length > max ? text[..max] : text;
         }
+        // #region agent log
+        DebugNdjson.Write("C", "CoreState.NotifyHost", "delivery_write", new { hostIdLen = target.HostId.Length, textLen = Field(reference.Selection, "text", 8192).Length });
+        // #endregion
         var node = Wire.Node(new
         {
             requestId = delivery.RequestId,

@@ -131,7 +131,14 @@ namespace OfficeInEditor.OfficeAddin
         private EmbeddedDocumentBindings.Binding ActiveBinding()
         { try { return selection?.Documents.Embedded.Find(selection.Documents.Active()); } catch { return null; } }
         public bool GetSavePeriodic(object control) => ActiveBinding()?.Periodic ?? autoSave?.Periodic ?? false;
+        public bool GetSaveOnClose(object control) => ActiveBinding()?.SaveOnClose ?? true;
         public string GetSaveInterval(object control) => (ActiveBinding()?.Seconds ?? autoSave?.Seconds ?? 60).ToString();
+        public void SetSaveOnClose(object control, bool enabled)
+        {
+            var binding = ActiveBinding();
+            if (binding != null) ConfigureEmbeddedSaveOnClose(binding, enabled);
+            Invalidate();
+        }
         public void SetSavePeriodic(object control, bool enabled)
         {
             var binding = ActiveBinding();
@@ -406,6 +413,9 @@ namespace OfficeInEditor.OfficeAddin
                         "routeVersion", routeVersion, "requestId", requestId)).ConfigureAwait(false);
                     bool queued = Json.IsTrue(Json.Get(delivered, "queued"));
                     string reason = Json.Text(delivered, "reason");
+                    DebugSession("C", "OfficeAddin.BeginAddToChat", queued ? "queued" : "not_queued",
+                        "{\"queued\":" + (queued ? "true" : "false") + ",\"reason\":\"" + (reason ?? "") + "\",\"hasSession\":" +
+                        (string.IsNullOrEmpty(sessionId) ? "false" : "true") + "}");
                     await OnUiAsync(() =>
                     {
                         status = queued ? "已投递到聊天输入框"
@@ -416,6 +426,8 @@ namespace OfficeInEditor.OfficeAddin
                 }
                 catch (Exception error)
                 {
+                    DebugSession("C", "OfficeAddin.BeginAddToChat", "error",
+                        "{\"type\":\"" + error.GetType().Name + "\"}");
                     await OnUiAsync(() => status = "未投递").ConfigureAwait(false);
                     if (manual) await ShowErrorAsync(error).ConfigureAwait(false);
                 }
@@ -468,11 +480,30 @@ namespace OfficeInEditor.OfficeAddin
                 try
                 {
                     await core.CallAsync("office.configure_save_window", Json.Object("officeId", sessionId,
-                        "documentId", documentId, "enabled", enabled, "seconds", seconds)).ConfigureAwait(false);
+                        "documentId", documentId, "enabled", enabled, "seconds", seconds, "saveOnClose", binding.SaveOnClose)).ConfigureAwait(false);
                     await OnUiAsync(() =>
                     {
                         var current = selection.Documents.Embedded.Find(selection.Documents.Resolve(documentId));
                         if (current != null && current.SessionId == sessionId) { current.Periodic = enabled; current.Seconds = seconds; }
+                        status = "";
+                    }).ConfigureAwait(false);
+                }
+                catch (Exception error) { await ShowErrorAsync(error).ConfigureAwait(false); }
+            });
+        }
+        private void ConfigureEmbeddedSaveOnClose(EmbeddedDocumentBindings.Binding binding, bool enabled)
+        {
+            string documentId = selection.Documents.Bind(binding.Document), sessionId = binding.SessionId;
+            Task.Run(async () =>
+            {
+                try
+                {
+                    await core.CallAsync("office.configure_save_window", Json.Object("officeId", sessionId,
+                        "documentId", documentId, "saveOnClose", enabled)).ConfigureAwait(false);
+                    await OnUiAsync(() =>
+                    {
+                        var current = selection.Documents.Embedded.Find(selection.Documents.Resolve(documentId));
+                        if (current != null && current.SessionId == sessionId) current.SaveOnClose = enabled;
                         status = "";
                     }).ConfigureAwait(false);
                 }
@@ -550,14 +581,19 @@ namespace OfficeInEditor.OfficeAddin
                         "\",\"message\":\"" + message + "\",\"data\":" + dataJson + ",\"timestamp\":" +
                         DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + "}";
                     var bytes = Encoding.UTF8.GetBytes(body);
-                    var request = (System.Net.HttpWebRequest)System.Net.WebRequest.Create("http://127.0.0.1:7884/ingest/93344ccb-bd6f-4fa7-8e2d-f58c925f8e0b");
-                    request.Method = "POST";
-                    request.ContentType = "application/json";
-                    request.Headers["X-Debug-Session-Id"] = "4dd893";
-                    request.Timeout = 250;
-                    request.ContentLength = bytes.Length;
-                    using (var stream = request.GetRequestStream()) stream.Write(bytes, 0, bytes.Length);
-                    using (var response = request.GetResponse()) { }
+                    foreach (string url in new[] {
+                        "http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093",
+                        "http://127.0.0.1:7884/ingest/93344ccb-bd6f-4fa7-8e2d-f58c925f8e0b" })
+                    {
+                        var request = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(url);
+                        request.Method = "POST";
+                        request.ContentType = "application/json";
+                        request.Headers["X-Debug-Session-Id"] = "4dd893";
+                        request.Timeout = 250;
+                        request.ContentLength = bytes.Length;
+                        using (var stream = request.GetRequestStream()) stream.Write(bytes, 0, bytes.Length);
+                        using (var response = request.GetResponse()) { }
+                    }
                 }
                 catch { }
             });

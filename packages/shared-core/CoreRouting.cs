@@ -239,6 +239,9 @@ public sealed partial class CoreState
             lock (sync) (target, version) = ResolveDeliveryTarget(value, binding);
             if (target is null)
             {
+                // #region agent log
+                DebugNdjson.Write("C", "CoreRouting.CaptureAndDeliver", "no_target", new { chats = chats.Count, documentId });
+                // #endregion
                 var skipped = Wire.Node(new { queued = false, reason = "target_unavailable", brokerEpoch });
                 request.Completion.TrySetResult(skipped);
                 return skipped?.DeepClone();

@@ -113,7 +113,7 @@ OneNote 现代客户端、仅云笔记本、无 `IOleObject`/`IOleDocument`/`IOl
 
 1. **保存按钮**（OLE 原位功能区、Ctrl+S、MCP `office_save_document`）都进入容器 `IOleClientSite.SaveObject`：对用户原路径 `IPersistFile.Save`。不得因 `bindSource:false` 就返回 `E_NOTIMPL`。不得把内存 `IStorage` 当 OOXML 写回 `.docx/.xlsx/.pptx`。
 2. **创建**用暂存副本做 `OleCreateFromFile`，避免打开阶段截断原件。未绑定源文件的关闭用 `OLECLOSE_NOSAVE`，禁止 `PROMPTSAVE` 把空嵌入写回原件。
-3. **只保留定时保存**。取消「编辑后保存」开关与 2 秒去抖写盘。定时保存默认开启、间隔默认 60 秒（5–3600），实现为 **周期静默触发保存按钮**（独立模式 `CommandBars.ExecuteMso("FileSave")`，标签嵌入模式直接 `SaveObject`），不另写一套序列化、不 Close/Quit、不另存副本、不改 `AutoSaveOn`。
+3. **只保留定时保存**，以及并列的 **关标签保存**（默认开）。取消「编辑后保存」开关与 2 秒去抖写盘。定时保存默认开启、间隔默认 60 秒（5–3600），实现为 **周期静默触发保存按钮**（独立模式 `CommandBars.ExecuteMso("FileSave")`，标签嵌入模式直接 `SaveObject`），不另写一套序列化、不 Close/Quit、不另存副本、不改 `AutoSaveOn`。关最后一个同文件标签时，关标签保存开启则 `SaveObject`，关闭则不写盘。
 4. 无改动可不写盘；外部改文件、只读、冲突则暂停该文档的定时保存，短状态，不弹窗风暴。干净文档不因心跳读全文。
 5. 安装时若 Office 正在运行，不得覆盖已加载的加载项 DLL；Ribbon 变更等到 Office 下次启动。标签内保存不依赖这次 DLL 替换，走 Core。
 
@@ -125,6 +125,12 @@ OneNote 现代客户端、仅云笔记本、无 `IOleObject`/`IOleDocument`/`IOl
 
 - 一次打开 **多个** 自定义编辑器标签（同一应用多种文件，或几种应用一起）；
 - **多种** 范围内 Office 同时处于打开中或已嵌套。
+- **同一原件的多个标签共用一份文档对象**。第二个及以后的标签用 `IOleDocumentView.Clone` / `CreateView`，服务器不支持多视图时共用同一 HWND。任一标签里的编辑就是这份文档；禁止为同文件再 `OleCreateFromFile` 或静默复制工作副本。最后一个标签拆除对象。
+- **Office 自定义编辑器不走默认预览「新换旧」**。`vscode.openWith` 用 `{ preview: false }`；标签一出现就 `keepEditor`，并用 `tabGroups.onDidChangeTabs` 把仍为 preview 的 Office 标签转成普通标签。不得改全局 `workbench.editor.enablePreview`。
+
+关闭：
+
+- Ribbon「关标签保存」与「定时保存」并列，默认开。关最后一个该文件标签时，开则走 `SaveObject`，关则 `OLECLOSE_NOSAVE`。先 Hide/Destroy 容器 HWND，避免标签已关表面仍停在 IDE 上。
 
 计时与排队：
 
