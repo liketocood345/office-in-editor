@@ -69,7 +69,8 @@ public sealed class AppServer(CoreState state) : IAsyncDisposable
             if (context.Request.Path == "/app/events" && context.Request.Method == "GET")
             {
                 var targetId = context.Request.Query["targetId"].ToString();
-                var signals = state.ConnectApp(targetId, token);
+                var connection = state.ConnectApp(targetId, token);
+                var signals = connection.Reader;
                 try
                 {
                     context.Response.ContentType = "text/event-stream";
@@ -91,7 +92,7 @@ public sealed class AppServer(CoreState state) : IAsyncDisposable
                         while (signals.TryRead(out _)) { }
                     }
                 }
-                finally { state.DisconnectApp(targetId); }
+                finally { state.DisconnectApp(targetId, connection.Id); }
                 return;
             }
             if (context.Request.Path == "/app/ack" && context.Request.Method == "POST")

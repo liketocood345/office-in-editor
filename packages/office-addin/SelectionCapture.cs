@@ -23,9 +23,11 @@ namespace OfficeInEditor.OfficeAddin
         { this.application = application; this.kind = kind; this.officeId = officeId;
             Documents = new DocumentRegistry(application, kind, officeId); }
 
-        internal object Capture()
+        internal object Capture(string documentId = null)
         {
             captureClock = Stopwatch.StartNew();
+            if (!string.IsNullOrEmpty(documentId) && !Documents.IsActive(Documents.Resolve(documentId)))
+                throw new BridgeException("DOCUMENT_CHANGED");
             Dictionary<string, object> result;
             try
             {
@@ -41,6 +43,11 @@ namespace OfficeInEditor.OfficeAddin
             catch { throw new BridgeException("NO_SUPPORTED_SELECTION"); }
             if (Wire.Utf8.GetByteCount(Json.Encode(result)) > MaxSelectionBytes)
                 throw new BridgeException("SELECTION_TOO_LARGE");
+            if (!string.IsNullOrEmpty(documentId))
+            {
+                Documents.Resolve(documentId);
+                if (Json.Text(result, "documentId") != documentId) throw new BridgeException("DOCUMENT_CHANGED");
+            }
             return result;
         }
 
@@ -54,9 +61,15 @@ namespace OfficeInEditor.OfficeAddin
 
         private Dictionary<string, object> Word()
         {
-            if (Convert.ToInt32(application.Documents.Count) == 0) throw new BridgeException("NO_DOCUMENT");
-            dynamic document = application.ActiveDocument;
-            dynamic range = application.Selection.Range;
+            dynamic document = Documents.Active();
+            dynamic range = Documents.Embedded.SelectionRange((object)document) ?? (object)application.Selection.Range;
+            try
+            {
+                object owner = range.Document;
+                if (!DocumentRegistry.SameObject(owner, document)) throw new BridgeException("DOCUMENT_CHANGED");
+            }
+            catch (BridgeException) { throw; }
+            catch { if (System.Runtime.InteropServices.Marshal.IsComObject((object)range)) throw new BridgeException("DOCUMENT_CHANGED"); }
             int start = Convert.ToInt32(range.Start), end = Convert.ToInt32(range.End);
             if (end <= start) throw new BridgeException("NO_SELECTION");
             // Guard before requesting a potentially huge COM BSTR. No silently truncated text.

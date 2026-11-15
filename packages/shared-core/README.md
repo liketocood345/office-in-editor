@@ -30,9 +30,9 @@ Pipe identity is derived from a hash of the Windows SID. A named mutex prevents 
 
 `health` reports version, explicit capabilities, `appOrigin`, `appPort`, bounded storage status and aggregate owner counts. Lists are direct arrays. Capture results are reference metadata with `refId` (and `id` alias), application/document identity, display name, kind, creation time, text length, SHA-256 and native save observations. Unknown `autoSaveAvailable` remains null; `autoSaveState` is preserved when supplied.
 
-The broker implements host/chat/Office registration and lists; Office callback capture; immutable reference capture/list/get/explicit release; deduplicated delivery and selection-plus-delivery; token-authorized delivery listing/acknowledgement; and explicit external opening of existing local DOCX/XLSX/PPTX through the registered Microsoft Office application.
+The broker implements host/chat/Office registration and lists; Office callback capture; immutable reference capture/list/get/explicit release; deduplicated delivery and selection-plus-delivery; token-authorized delivery listing/acknowledgement; opening existing local DOCX/XLSX/PPTX through a Core-owned x64 OLE document host (`OleCreateFromFile` + `ActivateMe`) with fallback to the registered Microsoft Office executable; and window attach/layout/detach against that OLE HWND or, if OLE is inactive, the Office add-in.
 
-`office.route.get` always reports standalone mode with `native_embedding_unavailable`. Native editor embedding and native AutoSave redirection remain unsupported. Explicit document writes are limited to the declared recoverable whitelist and a manual Save; there is no automatic save engine, macro execution, arbitrary COM reflection, or file deletion tool.
+`office.route.get` reports embedded mode backed by the Core OLE document host. Native AutoSave redirection remains unsupported. Explicit document writes are limited to the declared recoverable whitelist and a manual Save; there is no automatic save engine, macro execution, arbitrary COM reflection, or file deletion tool. The editor tab does not locate document content.
 
 Host registration returns a lease required by `host.unregister`. Office registration must originate from the declared live Office process, and its callback pipe must match `office-in-editor-office-<pid>-<instanceId>`. COM objects stay in the Office add-in; capture is delegated to `captureSelection` through its pipe. The core does not implement or emulate Office STA dispatch.
 
@@ -56,4 +56,4 @@ Startup reads only the bounded reference directory. Unexpected entries, linked d
 
 Delivery queues, targets, process leases and request tombstones are bounded memory state: 32 host/Office/chat/MCP-owner registrations, 512 deliveries, 32 queued items per target, and 1024 deduplication entries. References survive a broker restart; ephemeral chat routes and delivery receipts do not. After restart clients must explicitly register targets again and inspect the reference inbox; a lost receipt must not be reported as attached. No document write request exists in this version, so worker shutdown cannot abandon a core-owned COM write.
 
-The main capability gaps remain explicit. Successful MCP selection capture or a truthful external Office launch does not establish native embedding or native AutoSave redirection.
+The remaining capability gap is native AutoSave redirection. Successful MCP selection capture or tab window placement does not change that.

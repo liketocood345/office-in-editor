@@ -4,6 +4,7 @@ import * as net from "node:net";
 import { randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
+import { createContext, runInContext } from "node:vm";
 
 const root = fileURLToPath(new URL("../../../../", import.meta.url));
 const compiled = await build({
@@ -12,6 +13,55 @@ const compiled = await build({
   absWorkingDir: root,
 });
 const sdk = await import("data:text/javascript;base64," + Buffer.from(compiled.outputFiles[0].text).toString("base64"));
+const uiBuild = await build({ entryPoints: [fileURLToPath(new URL("../src/ui.ts", import.meta.url))],
+  bundle: true, platform: "node", format: "esm", target: "node18", write: false, absWorkingDir: root });
+const ui = await import("data:text/javascript;base64," + Buffer.from(uiBuild.outputFiles[0].text).toString("base64"));
+
+test("webview boot reports ready and geometry without global collisions; ACK stops retries", () => {
+  const messages = [], timers = [], listeners = {};
+  const nodes = Object.fromEntries(["status", "surface", "ole-root"].map(id => [id, { hidden: true, addEventListener() {} }]));
+  const context = createContext({
+    acquireVsCodeApi: () => ({ postMessage: value => messages.push(value) }),
+    document: { getElementById: id => nodes[id], body: {}, title: "" },
+    window: { innerWidth: 900, innerHeight: 600, addEventListener: (name, handler) => { listeners[name] = handler; } },
+    ResizeObserver: class { observe() {} }, setTimeout: callback => timers.push(callback),
+  });
+  runInContext("const status = 'existing browser binding';", context);
+  const surfaceToken = "oie-surface-" + "a".repeat(32);
+  const html = ui.hostHtml("Test", "Loading", surfaceToken);
+  runInContext(html.match(/<script nonce="[^"]+">([\s\S]*?)<\/script>/u)[1], context);
+  assert.equal(messages[0].action, "ready");
+  assert.equal(messages[1].action, "layout");
+  assert.equal(messages[1].width, 900);
+  assert.equal(messages[1].surfaceToken, surfaceToken);
+  assert.equal(messages[1].clientOnly, true);
+  assert.equal(html.includes("ole-root"), true);
+  assert.equal(html.includes("oie-beacon"), true);
+  assert.equal(html.includes("width:1px"), true);
+  assert.equal(html.includes("background:#000"), true);
+  assert.equal(html.includes(surfaceToken + ":tl"), true);
+  assert.equal(html.includes("oie-surface-label"), false);
+  assert.equal(html.includes("open-external"), false);
+  assert.equal(timers.length, 4);
+  listeners.message({ data: { kind: "layout-ack" } });
+  for (const callback of timers) callback();
+  assert.equal(messages.length, 2);
+  listeners.message({ data: { kind: "layout-request" } });
+  assert.equal(messages.length, 3);
+  listeners.message({ data: { kind: "attached" } });
+  assert.equal(nodes.status.hidden, true);
+  assert.equal(html.includes("open-external"), false);
+});
+
+test("editor document open uses an explicit bounded pipe budget", async () => {
+  assert.equal(sdk.OPEN_DOCUMENT_TIMEOUT_MS, 60_000);
+  assert.equal(sdk.MAX_PIPE_TIMEOUT_MS, 60_000);
+  let call;
+  const broker = new sdk.OfficeBroker({ request: async (...args) => { call = args; return {}; } });
+  await broker.openInOffice("fixture.docx", "embedded", { fallback: false });
+  assert.equal(call[0], "office.open");
+  assert.equal(call[2].timeoutMs, 60_000);
+});
 
 test("endpoint accepts only the versioned user pipe namespace", () => {
   assert.deepEqual(sdk.parseEndpoint(JSON.stringify({

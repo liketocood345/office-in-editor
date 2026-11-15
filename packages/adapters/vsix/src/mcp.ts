@@ -41,7 +41,7 @@ export class McpRegistration implements vscode.Disposable {
   private statusValue: McpRegistrationStatus = { mode: "unavailable" };
   private disposed = false;
 
-  constructor(private readonly extensionPath: string) {}
+  constructor(private readonly extensionPath: string, private readonly hostId = "") {}
 
   get status(): McpRegistrationStatus { return { ...this.statusValue }; }
 
@@ -60,7 +60,10 @@ export class McpRegistration implements vscode.Disposable {
       if (this.disposed) return;
       api.cursor.mcp.registerServer({
         name: "office-in-editor",
-        server: { command, args: ["--mcp"], env: { OFFICE_IN_EDITOR_HOST_KIND: "cursor" } },
+        server: { command, args: ["--mcp"], env: {
+          OFFICE_IN_EDITOR_HOST_KIND: "cursor",
+          OFFICE_IN_EDITOR_HOST_ID: this.hostId,
+        } },
       });
       this.cursorRegistered = true;
       this.statusValue = { mode: "cursor-official" };
@@ -76,7 +79,10 @@ export class McpRegistration implements vscode.Disposable {
             try {
               const command = await resolveCoreExecutable({ extensionPath: this.extensionPath });
               if (!localAccessAllowed() || this.disposed) return [];
-              return [new StdioDefinition("Office In Editor", command, ["--mcp"], { OFFICE_IN_EDITOR_HOST_KIND: "vscode" })];
+              return [new StdioDefinition("Office In Editor", command, ["--mcp"], {
+                OFFICE_IN_EDITOR_HOST_KIND: "vscode",
+                OFFICE_IN_EDITOR_HOST_ID: this.hostId,
+              })];
             } catch { return []; }
           },
           resolveMcpServerDefinition: definition => {

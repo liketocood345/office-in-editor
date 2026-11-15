@@ -14,8 +14,9 @@ namespace OfficeInEditor.OfficeAddin
         private readonly Dictionary<string, object> bindings = new Dictionary<string, object>(StringComparer.Ordinal);
         private readonly dynamic application;
         private readonly string kind, officeId;
-        internal DocumentRegistry(object application, string kind, string officeId)
-        { this.application = application; this.kind = kind; this.officeId = officeId; }
+        internal EmbeddedDocumentBindings Embedded { get; }
+        internal DocumentRegistry(object application, string kind, string officeId, EmbeddedDocumentBindings embedded = null)
+        { this.application = application; this.kind = kind; this.officeId = officeId; Embedded = embedded ?? new EmbeddedDocumentBindings(); }
 
         internal List<object> OpenDocuments()
         {
@@ -31,10 +32,28 @@ namespace OfficeInEditor.OfficeAddin
             if (count > 128) throw new BridgeException("TOO_MANY_OPEN_DOCUMENTS");
             var result = new List<object>();
             for (int i = 1; i <= count; i++) result.Add(collection.Item(i));
+            foreach (object document in Embedded.Documents())
+                if (!result.Exists(item => SameObject(item, document))) result.Add(document);
             return result;
         }
+        internal object Active()
+        {
+            try
+            {
+                object embedded = kind == "word" ? Embedded.Active() : null;
+                if (embedded != null) { Bind(embedded); return embedded; }
+                object document = kind == "word" ? (object)application.ActiveDocument :
+                    kind == "excel" ? (object)application.ActiveWorkbook : kind == "powerpoint" ? (object)application.ActivePresentation : null;
+                if (document == null) throw new BridgeException("NO_DOCUMENT");
+                Bind(document); return document;
+            }
+            catch (BridgeException) { throw; }
+            catch { throw new BridgeException("NO_DOCUMENT"); }
+        }
+        internal bool IsActive(object document) { try { return SameObject(Active(), document); } catch { return false; } }
         internal string Bind(object document)
         {
+            foreach (var existing in bindings) if (SameObject(existing.Value, document)) return existing.Key;
             string id = officeId + ":" + identities.GetValue(document, _ => new Identity()).Id;
             if (!bindings.ContainsKey(id) && bindings.Count >= 128)
             {
@@ -57,7 +76,7 @@ namespace OfficeInEditor.OfficeAddin
             { bindings.Remove(id); throw new BridgeException("DOCUMENT_CLOSED"); }
             return document;
         }
-        private static bool SameObject(object a, object b)
+        internal static bool SameObject(object a, object b)
         {
             if (ReferenceEquals(a, b)) return true;
             if (!Marshal.IsComObject(a) || !Marshal.IsComObject(b)) return false;
@@ -69,12 +88,14 @@ namespace OfficeInEditor.OfficeAddin
         {
             dynamic document = documentObject;
             string name = Convert.ToString(document.Name, CultureInfo.InvariantCulture);
+            if (!string.IsNullOrEmpty(name) && Path.IsPathRooted(name)) name = Path.GetFileName(name);
             if (name == null || name.Length > 256) throw new BridgeException("INVALID_DOCUMENT");
-            string source = null;
+            var embedded = Embedded.Find(documentObject);
+            string source = embedded?.Path;
             try
             {
                 string fullName = Convert.ToString(document.FullName, CultureInfo.InvariantCulture);
-                if (!string.IsNullOrEmpty(fullName) && fullName.Length <= 32767 && fullName.Length > 2 &&
+                if (source == null && !string.IsNullOrEmpty(fullName) && fullName.Length <= 32767 && fullName.Length > 2 &&
                     char.IsLetter(fullName[0]) && fullName[1] == ':' && (fullName[2] == '\\' || fullName[2] == '/'))
                     source = Path.GetFullPath(fullName);
             }
@@ -85,9 +106,10 @@ namespace OfficeInEditor.OfficeAddin
             try { enabled = Convert.ToBoolean(document.AutoSaveOn, CultureInfo.InvariantCulture); state = enabled ? "enabled" : "off_or_unavailable"; }
             catch { state = "unsupported"; }
             return Json.Object("application", kind, "documentId", Bind(documentObject), "documentName", name,
+                "sessionId", embedded?.SessionId, "nativeEmbedding", embedded != null, "sourceVerified", embedded?.SourceVerified ?? false,
                 "sourcePath", source, "dirty", dirty, "autoSaveAvailable", enabled ? (object)true : null,
                 "autoSaveEnabled", enabled, "autoSaveState", state, "nativeAutoSaveLocalRedirect", false);
         }
-        internal void Clear() => bindings.Clear();
+        internal void Clear() { bindings.Clear(); Embedded.Clear(); }
     }
 }

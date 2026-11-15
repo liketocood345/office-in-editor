@@ -1,8 +1,8 @@
 {
   "name": "office-in-editor",
   "displayName": "Office in Editor",
-  "description": "A privacy-conscious Office collaboration bridge for VS Code and Cursor. Native Office embedding and local AutoSave redirection are explicitly unsupported.",
-  "version": "0.1.0",
+  "description": "Local Office collaboration and configurable saving for VS Code and Cursor.",
+  "version": "0.1.4",
   "publisher": "liketocood345",
   "license": "BSD-3-Clause",
   "private": true,
@@ -32,6 +32,7 @@
   "main": "./dist/extension.js",
   "activationEvents": [
     "onView:officeInEditor.inbox",
+    "onCustomEditor:officeInEditor.document",
     "onMcpServerDefinitionProvider:office-in-editor"
   ],
   "capabilities": {
@@ -125,6 +126,35 @@
         "id": "office-in-editor",
         "label": "Office in Editor"
       }
+    ],
+    "customEditors": [
+      {
+        "viewType": "officeInEditor.document",
+        "displayName": "Office in Editor",
+        "selector": [
+          { "filenamePattern": "*.docx" },
+          { "filenamePattern": "*.doc" },
+          { "filenamePattern": "*.docm" },
+          { "filenamePattern": "*.dotx" },
+          { "filenamePattern": "*.rtf" },
+          { "filenamePattern": "*.xlsx" },
+          { "filenamePattern": "*.xls" },
+          { "filenamePattern": "*.xlsm" },
+          { "filenamePattern": "*.xlsb" },
+          { "filenamePattern": "*.csv" },
+          { "filenamePattern": "*.pptx" },
+          { "filenamePattern": "*.ppt" },
+          { "filenamePattern": "*.pptm" },
+          { "filenamePattern": "*.vsdx" },
+          { "filenamePattern": "*.vsd" },
+          { "filenamePattern": "*.vstx" },
+          { "filenamePattern": "*.one" },
+          { "filenamePattern": "*.onepkg" },
+          { "filenamePattern": "*.pub" },
+          { "filenamePattern": "*.mpp" }
+        ],
+        "priority": "default"
+      }
     ]
   },
   "scripts": {
@@ -133,7 +163,7 @@
     "test": "node --test tests/*.test.mjs packages/adapters/vsix/test/*.test.mjs",
     "test:integration": "node scripts/test-integration.mjs",
     "privacy": "node scripts/privacy-scan.mjs",
-    "package:vsix": "npm run build && vsce package --no-dependencies --allow-missing-repository --out artifacts/office-in-editor-0.1.0.vsix",
+    "package:vsix": "npm run build && vsce package --no-dependencies --allow-missing-repository --out artifacts/office-in-editor-0.1.4.vsix",
     "package:setup": "node scripts/package-setup.mjs",
     "vscode:prepublish": "node scripts/build-extension.mjs"
   },

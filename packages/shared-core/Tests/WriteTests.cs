@@ -108,6 +108,7 @@ internal static class WriteTests
                                     var nonce = Guid.NewGuid().ToString("N"); preparations[Wire.Text(parameters, "operationId")] = nonce;
                                     result = Wire.Node(new { documentId, application = "word", beforeHash = Hash(documentId), recovery = new { text = Text(documentId) }, prepared = new { nonce } }); break;
                                 case "applyEdit":
+                                    if (parameters?["recovery"]?["text"]?.GetValue<string>() != Text(documentId)) throw new CoreFault("RECOVERY_UNAVAILABLE", "Compensation must cross the adapter boundary.");
                                     var operationId = Wire.Text(parameters, "operationId");
                                     if (preparations.GetValueOrDefault(operationId) != parameters?["prepared"]?["nonce"]?.GetValue<string>() || Hash(documentId) != Wire.Text(parameters, "beforeHash")) throw new CoreFault("DOCUMENT_CONFLICT", "No change.");
                                     DurableRecoveryObserved = Directory.GetFiles(Path.Combine(root, "operations"), "*.json").Any(file =>

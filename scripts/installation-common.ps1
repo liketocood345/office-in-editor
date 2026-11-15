@@ -32,6 +32,51 @@ function Get-OieCli {
   $name=if($Kind -eq 'vscode'){'code'}elseif($Kind -eq 'cursor'){'cursor'}else{throw 'Unknown editor adapter.'}
   return Get-Command $name -ErrorAction SilentlyContinue
 }
+function Test-OieOfficeRunning {
+  return [bool](Get-Process -Name @('WINWORD','EXCEL','POWERPNT') -ErrorAction SilentlyContinue)
+}
+
+function Clear-OieDisabledItems {
+  param([switch]$SkipIfOfficeRunning)
+  if ($SkipIfOfficeRunning -and (Test-OieOfficeRunning)) {
+    return [pscustomobject]@{ Cleared = 0; Skipped = $true; Reason = 'Office is running; DisabledItems unchanged' }
+  }
+  $cleared = 0
+  $needle = 'officeineditor.addin'
+  foreach ($view in @([Microsoft.Win32.RegistryView]::Registry64, [Microsoft.Win32.RegistryView]::Registry32)) {
+    $hkcu = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::CurrentUser, $view)
+    try {
+      $office = $hkcu.OpenSubKey('Software\Microsoft\Office', $true)
+      if ($null -eq $office) { continue }
+      try {
+        foreach ($versionName in $office.GetSubKeyNames()) {
+          $version = $office.OpenSubKey($versionName, $true)
+          if ($null -eq $version) { continue }
+          try {
+            foreach ($appName in @('Word','Excel','PowerPoint','Common')) {
+              $disabled = $version.OpenSubKey("$appName\Resiliency\DisabledItems", $true)
+              if ($null -eq $disabled) { continue }
+              try {
+                foreach ($valueName in @($disabled.GetValueNames())) {
+                  $raw = $disabled.GetValue($valueName)
+                  if ($raw -isnot [byte[]]) { continue }
+                  $unicode = [Text.Encoding]::Unicode.GetString([byte[]]$raw)
+                  $ascii = [Text.Encoding]::ASCII.GetString([byte[]]$raw)
+                  if ($unicode.IndexOf($needle, [StringComparison]::OrdinalIgnoreCase) -lt 0 -and
+                      $ascii.IndexOf($needle, [StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
+                  $disabled.DeleteValue($valueName, $false)
+                  $cleared++
+                }
+              } finally { $disabled.Dispose() }
+            }
+          } finally { $version.Dispose() }
+        }
+      } finally { $office.Dispose() }
+    } finally { $hkcu.Dispose() }
+  }
+  return [pscustomobject]@{ Cleared = $cleared; Skipped = $false }
+}
+
 function Test-OieExtensionPresent {
   param([object]$Cli,[string]$Id)
   if(-not $Cli){throw 'The editor CLI is not available to verify ownership.'}

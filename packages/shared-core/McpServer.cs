@@ -7,6 +7,7 @@ public sealed class McpServer
 {
     private const string ResourceUri = "ui://office-in-editor/chat";
     private readonly string ownerId = "mcp-" + Guid.NewGuid().ToString("N");
+    private readonly string hostId = Environment.GetEnvironmentVariable("OFFICE_IN_EDITOR_HOST_ID") ?? "";
     private string? ownerLease;
     private static readonly HashSet<string> Versions = ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25", "2026-07-28"];
 
@@ -54,7 +55,7 @@ public sealed class McpServer
                 return Wire.Node(new { protocolVersion = Versions.Contains(requested) ? requested : "2025-11-25",
                     capabilities = new { tools = new { listChanged = false }, resources = new { subscribe = false, listChanged = false } },
                     serverInfo = new { name = "office-in-editor", version = RuntimeIdentity.Version },
-                    instructions = "Use explicitly registered Office instances. Inspect documents before capability-gated edits. Edit/save operation IDs are durable and never replay unknown outcomes; inspect the operation instead. Revert refuses subsequent user changes. Native Office embedding and native AutoSave local redirection are unavailable. Register a chat App explicitly before delivering references. No tool sends a chat message." });
+                    instructions = "Use explicitly registered Office instances. Inspect documents before capability-gated edits. Edit/save operation IDs are durable and never replay unknown outcomes; inspect the operation instead. Revert refuses subsequent user changes. Native AutoSave local redirection is unavailable. The editor tab hosts the Office window. Word save uses the same SaveObject path as the Save button; periodic save silently clicks that path every 60s. Selection and agent edits stay on the Office add-in and MCP. Register this chat with office_register_chat, then Word Add to Chat fills the composer without sending." });
             case "ping": return new JsonObject();
             case "tools/list": return new JsonObject { ["tools"] = ToolDefinitions() };
             case "resources/list":
@@ -62,7 +63,7 @@ public sealed class McpServer
             case "resources/templates/list": return Wire.Node(new { resourceTemplates = Array.Empty<object>() });
             case "resources/read": return await ReadResourceAsync(parameters);
             case "tools/call":
-                try { return await CallToolAsync(Wire.Text(parameters, "name"), parameters?["arguments"] ?? new JsonObject()); }
+                try { return await CallToolAsync(parameters); }
                 catch (Exception error)
                 {
                     var message = error is CoreFault fault ? fault.Code + ": " + fault.Message : "operation_failed: The operation did not complete. Do not automatically replay it.";
@@ -76,16 +77,31 @@ public sealed class McpServer
         await PipeClient.EnsureAsync(CancellationToken.None);
         return await PipeClient.CallAsync(RuntimeIdentity.PipeName, method, parameters, CancellationToken.None);
     }
-    private async Task<JsonNode?> CallToolAsync(string name, JsonNode args)
+    private async Task NoteRouteAsync(string? targetId, JsonNode? arguments = null, string? targetEpoch = null)
     {
+        try { await BrokerAsync("routing.touch", Wire.Node(new { ownerId, targetId = targetId ?? "", targetEpoch = targetEpoch ?? "",
+            officeId = Wire.Text(arguments, "officeId", 128, false), documentId = Wire.Text(arguments, "documentId", 160, false) })); }
+        catch { }
+    }
+    private static string MetaTargetId(JsonNode? parameters)
+    {
+        return parameters?["_meta"] is JsonObject meta && meta["officeInEditor"] is JsonObject office
+            ? Wire.Text(office, "targetId", 128, false)
+            : "";
+    }
+    private async Task<JsonNode?> CallToolAsync(JsonNode? parameters)
+    {
+        var name = Wire.Text(parameters, "name");
+        var args = parameters?["arguments"] as JsonObject ?? new JsonObject();
         if (name == "office_register_chat")
         {
             var label = Wire.Text(args, "label", 160, false);
-            var target = await BrokerAsync("chat.register", Wire.Node(new { ownerId, label = label == "" ? "Office reference chat" : label }));
+            var target = await BrokerAsync("chat.register", Wire.Node(new { ownerId, hostId, label = label == "" ? "Office reference chat" : label }));
+            await NoteRouteAsync(target?["id"]?.GetValue<string>());
             var publicTarget = target!.DeepClone(); publicTarget.AsObject().Remove("token"); publicTarget.AsObject().Remove("appOrigin");
             return new JsonObject
             {
-                ["content"] = Wire.Node(new[] { new { type = "text", text = "Registered this tool invocation's Office App target. Open the App to receive references; queued items are not attached until the App host accepts them." } }),
+                ["content"] = Wire.Node(new[] { new { type = "text", text = "Registered this chat." } }),
                 ["structuredContent"] = new JsonObject { ["target"] = publicTarget, ["registeredChatsOnly"] = true },
                 ["_meta"] = new JsonObject { ["officeInEditor"] = new JsonObject
                 {
@@ -94,6 +110,8 @@ public sealed class McpServer
                 } }
             };
         }
+        await NoteRouteAsync(MetaTargetId(parameters), args,
+            parameters?["_meta"]?["officeInEditor"]?["epoch"]?.GetValue<string>());
         var method = name switch
         {
             "office_list_documents" => "office.list", "office_capture_selection" => "office.capture", "office_list_references" => "reference.list",
@@ -151,11 +169,11 @@ public sealed class McpServer
                 new() { ["operationId"] = Field(128), ["documentId"] = Field() }, ["operationId"]),
             Tool("office_revert_edit", "Explicitly revert a confirmed applied operation only when Office verifies its post-edit hash still matches. Refuses to overwrite subsequent user changes.", false,
                 new() { ["officeId"] = Field(128), ["documentId"] = Field(), ["operationId"] = Field(128) }, ["officeId", "documentId", "operationId"]),
-            Tool("office_save_document", "Explicit manual Save through the bound Office document. Requires a unique operationId; no AutoSave redirection or periodic save is implemented. Unknown save outcomes are not replayed.", false,
+            Tool("office_save_document", "Explicit manual Save through the bound Office document (same path as the Save button / IOleClientSite.SaveObject). Requires a unique operationId. Native AutoSave redirection is not implemented. Periodic silent Save is a separate host timer. Unknown save outcomes are not replayed.", false,
                 new() { ["officeId"] = Field(128), ["documentId"] = Field(), ["operationId"] = Field(128) }, ["officeId", "documentId", "operationId"]),
             Tool("office_release_operation", "Release recovery ONLY after the user explicitly confirms it is no longer needed. The irreversible release retains a small deduplication tombstone and never deletes the original document.", false,
                 new() { ["documentId"] = Field(), ["operationId"] = Field(128), ["confirm"] = new JsonObject { ["type"] = "boolean", ["const"] = true } }, ["documentId", "operationId", "confirm"]),
-            Tool("office_capabilities", "Report supported operations and explicit native-embedding/AutoSave limitations.", true, new(), []),
+            Tool("office_capabilities", "Report supported operations. The editor tab hosts the Office window; selection and agent edits stay on the Office add-in and MCP. Native AutoSave local redirection remains unavailable.", true, new(), []),
             Tool("office_register_chat", "Register an Office reference App for this specific tool invocation. Only explicitly registered chats can be targeted. Open the returned App; it only updates context and never submits a message.", false, new() { ["label"] = Field() }, []),
             Tool("office_app_ack", "App-only acknowledgement after the App host accepts updateModelContext; never call on behalf of a model.", false,
                 new() { ["targetId"] = Field(32), ["token"] = Field(64), ["requestId"] = Field(128), ["refId"] = Field(32), ["status"] = new JsonObject { ["type"] = "string", ["enum"] = Wire.Node(new[] { "attached", "unsupported", "failed" }) } },

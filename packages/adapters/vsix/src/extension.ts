@@ -12,10 +12,19 @@ import type {
 import { McpRegistration, hostKind, localAccessAllowed } from "./mcp";
 import { InboxTree, displayText } from "./tree";
 import { ErrorNoticeBudget } from "./notices";
-import { actionButton, capabilitiesNotice, escapeHtml, panelHtml } from "./ui";
+import { actionButton, escapeHtml, hostHtml, panelHtml } from "./ui";
+import { tryHostBounds } from "./host-window";
+import { officeTabAppearance } from "./office-theme";
 
 const REF_ID = /^(?:[a-f0-9]{32}|[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})$/iu;
-const DOCUMENT_EXTENSIONS = new Set([".docx", ".xlsx", ".pptx"]);
+const DOCUMENT_EXTENSIONS = new Set([
+  ".docx", ".doc", ".docm", ".dotx", ".dotm", ".rtf",
+  ".xlsx", ".xls", ".xlsm", ".xlsb", ".xltx", ".xltm", ".csv",
+  ".pptx", ".ppt", ".pptm", ".potx", ".potm", ".ppsx",
+  ".vsdx", ".vsd", ".vstx", ".vssx", ".vstm",
+  ".one", ".onepkg",
+  ".pub", ".mpp",
+]);
 
 function assertLocalAccess(): void {
   if (process.platform !== "win32") throw new OfficeBridgeError("UNSUPPORTED_PLATFORM");
@@ -30,6 +39,22 @@ function referenceId(value: unknown): string | undefined {
     if (isRecord(value.reference)) return referenceId(value.reference);
   }
   return undefined;
+}
+
+async function waitForOffice(
+  broker: OfficeBroker,
+  application: string,
+  pid?: number,
+): Promise<string> {
+  const deadline = Date.now() + 20_000;
+  while (Date.now() < deadline) {
+    const offices = await broker.listOfficeInstances();
+    const match = offices.find(office => office.application === application && (pid == null || office.pid === pid))
+      ?? offices.find(office => office.application === application);
+    if (match) return match.officeId;
+    await new Promise(resolve => setTimeout(resolve, 250));
+  }
+  throw new OfficeBridgeError("OFFICE_NOT_FOUND");
 }
 
 function officeId(value: unknown): string | undefined {
@@ -57,6 +82,9 @@ class OfficeExtension implements vscode.Disposable {
   private readonly output = vscode.window.createOutputChannel("Office In Editor");
   private readonly hostId = hostKind() + ":" + randomUUID();
   private readonly panels = new Map<string, vscode.WebviewPanel>();
+  private readonly officeClosers = new Set<() => Promise<void>>();
+  private traceEvents = 0;
+  private loading?: { stage: string; elapsedMs: number };
   private readonly view: vscode.TreeView<import("./tree").InboxNode>;
   private lease?: HostLease;
   private snapshot?: DashboardSnapshot;
@@ -66,6 +94,7 @@ class OfficeExtension implements vscode.Disposable {
   private connectPromise?: Promise<OfficeBroker>;
   private disposed = false;
   private shutdownPromise?: Promise<void>;
+  private deliveryPump?: Promise<void>;
   readonly ready: Promise<void>;
 
   constructor(private readonly context: vscode.ExtensionContext) {
@@ -74,7 +103,7 @@ class OfficeExtension implements vscode.Disposable {
       () => this.registerHost(),
     );
     this.broker = new OfficeBroker(this.transport);
-    this.mcp = new McpRegistration(context.extensionPath);
+    this.mcp = new McpRegistration(context.extensionPath, this.hostId);
     this.view = vscode.window.createTreeView("officeInEditor.inbox", {
       treeDataProvider: this.tree,
       showCollapseAll: false,
@@ -103,6 +132,22 @@ class OfficeExtension implements vscode.Disposable {
     context.subscriptions.push(this.view.onDidChangeVisibility(event => {
       if (event.visible) void this.run(() => this.refresh(), false);
     }));
+    const extension = this;
+    context.subscriptions.push(vscode.window.registerCustomEditorProvider(
+      "officeInEditor.document",
+      {
+        openCustomDocument(uri: vscode.Uri) {
+          return { uri, dispose() { /* The editor tab holds no separate Office document model. */ } };
+        },
+        resolveCustomEditor(document: vscode.CustomDocument, webviewPanel: vscode.WebviewPanel) {
+          // Resolve immediately: the iframe needs the editor to be resolved to lay out.
+          void extension.hostDocument(document.uri, webviewPanel).catch(error => {
+            extension.output.appendLine(`host_initialization ${errorCode(error)}`);
+          });
+        },
+      },
+      { webviewOptions: { retainContextWhenHidden: true }, supportsMultipleEditorsPerDocument: false },
+    ));
     context.subscriptions.push(vscode.workspace.onDidGrantWorkspaceTrust(() => {
       void this.run(async () => {
         await this.mcp.refresh();
@@ -144,9 +189,56 @@ class OfficeExtension implements vscode.Disposable {
     });
     if (this.disposed) {
       try { await this.broker.unregisterHost(lease); } catch { /* The old worker may already have stopped. */ }
+      this.broker.bindHost(undefined);
       return;
     }
     this.lease = lease;
+    this.broker.bindHost(lease);
+    this.startDeliveryPump();
+  }
+
+  private startDeliveryPump(): void {
+    if (this.deliveryPump || this.disposed) return;
+    this.deliveryPump = this.pumpHostDeliveries();
+  }
+
+  private async pumpHostDeliveries(): Promise<void> {
+    while (!this.disposed) {
+      const lease = this.lease;
+      if (!lease) {
+        await new Promise(resolve => setTimeout(resolve, 500));
+        continue;
+      }
+      try {
+        const event = await this.broker.waitHostDelivery(lease, 25_000);
+        if (this.disposed) return;
+        if (event.waiting || typeof event.text !== "string") continue;
+        const placed = await this.presentInChat(event.documentName ?? "Word", event.text);
+        this.announce(placed ? "已放入聊天输入框，未自动发送。" : "已复制选区，聊天输入不可用。");
+        // #region agent log
+        fetch("http://127.0.0.1:7884/ingest/93344ccb-bd6f-4fa7-8e2d-f58c925f8e0b", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "C", location: "extension.ts:pumpHostDeliveries", message: "host_delivery", data: { placed, textLength: event.text.length, kind: event.kind ?? "" }, timestamp: Date.now() }) }).catch(() => {});
+        // #endregion
+      } catch {
+        await new Promise(resolve => setTimeout(resolve, 1_000));
+      }
+    }
+  }
+
+  private async presentInChat(documentName: string, text: string): Promise<boolean> {
+    const query = documentName + "\n\n" + text;
+    const attempts: Array<[string, unknown]> = [
+      ["workbench.action.chat.open", { query, isPartialQuery: true }],
+      ["workbench.action.chat.open", { query }],
+      ["composer.startComposerPrompt", { additionalContext: query }],
+    ];
+    for (const [command, argument] of attempts) {
+      try {
+        await vscode.commands.executeCommand(command, argument);
+        return true;
+      } catch { /* Try the next public chat command. */ }
+    }
+    try { await vscode.env.clipboard.writeText(query); } catch { return false; }
+    return false;
   }
 
   private async connect(): Promise<OfficeBroker> {
@@ -177,20 +269,10 @@ class OfficeExtension implements vscode.Disposable {
     await this.refresh();
     const snapshot = this.snapshot!;
     const panel = this.createPanel("officeInEditor.status", "Office In Editor · 状态");
-    panel.webview.html = panelHtml("Office 协作状态", capabilitiesNotice()
-      + "<p>本机 Office 实例：" + snapshot.offices.length
-      + " · 引用：" + snapshot.references.length
-      + " · 已登记具体聊天：" + snapshot.chats.length + "</p>" + this.operationStatusHtml());
-  }
-
-  private operationStatusHtml(): string {
-    const capability = this.snapshot?.health.capabilities.documentWrite;
-    const text = capability === undefined
-      ? "MCP 写能力：尚未读取 Core capabilities。"
-      : capability
-        ? "MCP 写能力：Core 已声明；具体操作受原生白名单、权限与可恢复事务约束。"
-        : "MCP 写能力：Core 当前未声明可用。";
-    return '<p class="muted">' + escapeHtml(text) + "</p>";
+    panel.webview.html = panelHtml("Office 协作状态",
+      "<p>Office " + snapshot.offices.length
+      + " · 引用 " + snapshot.references.length
+      + " · 聊天 " + snapshot.chats.length + "</p>");
   }
 
   private async showDiagnostics(): Promise<void> {
@@ -206,7 +288,7 @@ class OfficeExtension implements vscode.Disposable {
       mcpRegistration: this.mcp.status.mode,
       protocolVersion: this.snapshot?.health.protocolVersion ?? 1,
       coreVersion: this.snapshot ? displayText(this.snapshot.health.version, 64) : "unavailable",
-      nativeOfficeEmbedding: false,
+      nativeOfficeEmbedding: true,
       nativeAutoSaveLocalRedirect: false,
       panelEditing: false,
       agentOperations: "core-whitelist",
@@ -218,9 +300,7 @@ class OfficeExtension implements vscode.Disposable {
     };
     const panel = this.createPanel("officeInEditor.diagnostics", "Office In Editor · 脱敏诊断");
     panel.webview.html = panelHtml("脱敏诊断",
-      capabilitiesNotice()
-      + '<p>诊断仅包含能力、版本、数量和错误代码；不包含文档文字、文件路径、聊天名称、令牌或用户标识。</p><pre>'
-      + escapeHtml(JSON.stringify(report, null, 2)) + "</pre>");
+      "<pre>" + escapeHtml(JSON.stringify(report, null, 2)) + "</pre>");
   }
 
   private async chooseDocument(argument?: unknown): Promise<vscode.Uri | undefined> {
@@ -231,7 +311,7 @@ class OfficeExtension implements vscode.Disposable {
       canSelectFolders: false,
       canSelectMany: false,
       openLabel: "选择 Office 文件",
-      filters: { "Office 文档": ["docx", "xlsx", "pptx"] },
+      filters: { "Office 文档": ["docx", "doc", "xlsx", "xls", "pptx", "ppt", "vsdx", "vsd", "one", "pub", "mpp", "rtf"] },
     });
     const uri = selection?.[0];
     if (uri) await validateLocalDocument(uri);
@@ -242,43 +322,180 @@ class OfficeExtension implements vscode.Disposable {
     assertLocalAccess();
     const uri = await this.chooseDocument(argument);
     if (!uri) return;
-    const key = "session:" + uri.toString();
-    const existing = this.panels.get(key);
-    if (existing) { existing.reveal(); return; }
+    await vscode.commands.executeCommand("vscode.openWith", uri, "officeInEditor.document");
+  }
+
+  private async hostDocument(uri: vscode.Uri, panel: vscode.WebviewPanel): Promise<void> {
+    panel.webview.options = { enableScripts: true, localResourceRoots: [] };
     const name = displayText(path.basename(uri.fsPath));
-    const panel = this.createPanel("officeInEditor.session", name + " · Office 会话控制", key);
-    const render = (): void => {
-      panel.webview.html = panelHtml(name,
-        capabilitiesNotice()
-        + this.operationStatusHtml()
-        + '<p>所选文件：<strong>' + escapeHtml(name) + '</strong></p>'
-        + '<p>在独立 Microsoft Office 窗口中编辑。此标签页用于捕获选区、查看引用和选择已登记的具体聊天。</p>'
-        + '<div class="actions">'
-        + actionButton("open", "在已安装的 Microsoft Office 中打开")
-        + actionButton("capture", "选择 Office 实例并捕获选区")
-        + actionButton("chats", "查看已登记具体聊天")
-        + actionButton("refresh", "刷新状态") + "</div>"
-        + '<p class="muted">捕获前请在 Office 中选中需要引用的内容。收件箱只在明确刷新或操作后更新，不轮询文件。</p>');
+    const sessionId = "ole-" + randomUUID().replaceAll("-", "");
+    const started = performance.now();
+    const trace = (stage: string): void => {
+      this.loading = { stage, elapsedMs: Math.round(performance.now() - started) };
+      if (++this.traceEvents <= 1024) this.output.appendLine(`open=${sessionId.slice(4, 12)} stage=${stage} elapsedMs=${Math.round(performance.now() - started)}`);
     };
+    trace("tab_created");
+    // #region agent log
+    fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "C", location: "extension.ts:hostDocument", message: "tab_created", data: { sessionPrefix: sessionId.slice(4, 12) }, timestamp: Date.now() }) }).catch(() => {});
+    // #endregion
+    let officeId: string | undefined;
+    let attached = false;
+    let closed = false;
+    let bounds: import("../../../adapter-sdk/src").HostBounds | undefined;
+    let layoutRunning = false;
+    let layoutVersion = 0;
+    const layout = async (message?: unknown): Promise<void> => {
+      const next = tryHostBounds(message ?? bounds, bounds);
+      if (!next) return;
+      bounds = next;
+      ++layoutVersion;
+      if (!officeId || closed || layoutRunning) return;
+      layoutRunning = true;
+      try {
+        let sent: number;
+        do {
+          sent = layoutVersion;
+          await this.broker.layoutOfficeWindow(officeId, { ...bounds, visible: panel.visible });
+          attached = panel.visible;
+        } while (!closed && sent !== layoutVersion);
+      } finally { layoutRunning = false; }
+    };
+    const close = async (): Promise<void> => {
+      if (closed) return;
+      closed = true;
+      attached = false;
+      this.officeClosers.delete(close);
+      try { if (officeId) await this.broker.saveOfficeWindow(officeId); }
+      catch { /* Save failure still detaches; Core refuses to wipe a dirty source. */ }
+      try { await this.broker.detachOfficeWindow(officeId ?? sessionId); }
+      catch { /* Closing the tab must not kill Word/Excel/PowerPoint. */ }
+    };
+    this.officeClosers.add(close);
     panel.webview.onDidReceiveMessage((message: unknown) => {
-      if (!isRecord(message)) return;
-      const action = message.action;
-      if (action === "open") void this.run(() => this.openInOffice(uri));
-      else if (action === "capture") void this.run(() => this.captureSelection());
-      else if (action === "chats") void this.run(() => this.listRegisteredChats());
-      else if (action === "refresh") void this.run(async () => { await this.refresh(); render(); });
+      if (isRecord(message) && message.action === "layout") {
+        if (!tryHostBounds(message, bounds)) return;
+        if (!bounds) {
+          trace("geometry_received");
+          const first = tryHostBounds(message);
+          // #region agent log
+          fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "D", location: "extension.ts:layout", message: "geometry_received", data: { width: first?.width, height: first?.height, x: first?.x, y: first?.y, tokenLen: first?.surfaceToken?.length ?? 0, hasToken: Boolean(first?.surfaceToken) }, timestamp: Date.now() }) }).catch(() => {});
+          // #endregion
+        }
+        void panel.webview.postMessage({ kind: "layout-ack" });
+        void this.run(() => layout(message), false);
+      }
+      if (isRecord(message) && message.action === "ready") trace("webview_ready");
+      if (isRecord(message) && message.action === "script-error") trace("webview_script_error");
     }, undefined, this.context.subscriptions);
-    render();
+    const keepOfficeTab = async (): Promise<void> => {
+      const tabOf = (): vscode.Tab | undefined => vscode.window.tabGroups.all
+        .flatMap(group => group.tabs)
+        .find(tab => tab.input instanceof vscode.TabInputCustom && tab.input.uri.toString() === uri.toString());
+      const before = tabOf();
+      try {
+        if (panel.active) {
+          await vscode.commands.executeCommand("workbench.action.keepEditor");
+          await vscode.commands.executeCommand("workbench.action.pinEditor");
+        }
+      } catch { /* Pinning is best-effort against preview replacement. */ }
+      const after = tabOf();
+      // #region agent log
+      fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "H", location: "extension.ts:keepOfficeTab", message: "tab_keep", data: { panelActive: panel.active, panelVisible: panel.visible, beforePreview: before?.isPreview ?? null, beforePinned: before?.isPinned ?? null, afterPreview: after?.isPreview ?? null, afterPinned: after?.isPinned ?? null }, timestamp: Date.now() }) }).catch(() => {});
+      // #endregion
+    };
+    panel.onDidChangeViewState(event => {
+      // #region agent log
+      fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "H", location: "extension.ts:viewState", message: "view_state", data: { visible: event.webviewPanel.visible, active: event.webviewPanel.active, attached, closed, hasOffice: Boolean(officeId) }, timestamp: Date.now() }) }).catch(() => {});
+      // #endregion
+      void panel.webview.postMessage({ kind: "layout-request" });
+      if (event.webviewPanel.active && attached && !closed) void keepOfficeTab();
+      if (!officeId || closed || !bounds) return;
+      void this.run(() => layout(bounds), false);
+    }, undefined, this.context.subscriptions);
+    panel.onDidDispose(() => {
+      // #region agent log
+      fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "H", location: "extension.ts:dispose", message: "tab_disposed", data: { attached, closed, hasOffice: Boolean(officeId) }, timestamp: Date.now() }) }).catch(() => {});
+      // #endregion
+      void close();
+    }, undefined, this.context.subscriptions);
+    const surfaceToken = "oie-surface-" + sessionId.slice(4);
+    panel.webview.html = hostHtml(name, "正在打开 Office…", surfaceToken, officeTabAppearance());
+    await this.run(async () => {
+      const opening = this.connect();
+      trace("connect_started");
+      void opening.catch(() => {});
+      const overallDeadline = performance.now() + 60_000;
+      const deadline = Date.now() + 8_000;
+      while (!closed && !bounds && Date.now() < deadline) {
+        await panel.webview.postMessage({ kind: "layout-request" });
+        await new Promise(resolve => setTimeout(resolve, 250));
+      }
+      if (closed) { await opening; return; }
+      if (!bounds) {
+        trace("geometry_timeout");
+        // #region agent log
+        fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "C", location: "extension.ts:geometry_timeout", message: "fail_no_external", data: { launchedExternal: false }, timestamp: Date.now() }) }).catch(() => {});
+        // #endregion
+        await panel.webview.postMessage({ kind: "status", text: "标签几何初始化失败。" });
+        return;
+      }
+      const broker = await opening;
+      trace("core_connected");
+      if (closed) return;
+      // Test-only handshake probe: deliberately never enters Office/OLE.
+      if (this.context.extensionMode === vscode.ExtensionMode.Test && process.env.OIE_GEOMETRY_ONLY === "1") {
+        trace("geometry_verified");
+        closed = true;
+        this.officeClosers.delete(close);
+        return;
+      }
+      let opened;
+      try {
+        const remaining = overallDeadline - performance.now();
+        if (remaining < 250) throw new OfficeBridgeError("HOST_WINDOW_UNAVAILABLE");
+        trace("office_open_started");
+        // #region agent log
+        fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "F", location: "extension.ts:office_open", message: "embedded_request", data: { fallback: false, remainingMs: Math.round(remaining), visible: panel.visible, ...bounds }, timestamp: Date.now() }) }).catch(() => {});
+        // #endregion
+        opened = await broker.openInOffice(uri.fsPath, "embedded", { fallback: false, ...bounds, visible: panel.visible, sessionId, timeoutMs: remaining });
+        trace("office_open_completed");
+      }
+      catch (error) {
+        const code = errorCode(error);
+        trace(`open_failed_${code}`);
+        // #region agent log
+        fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "F", location: "extension.ts:open_failed", message: "fail_no_external", data: { code, launchedExternal: false, visible: panel.visible, elapsedMs: Math.round(performance.now() - started), remainingMs: Math.round(overallDeadline - performance.now()) }, timestamp: Date.now() }) }).catch(() => {});
+        // #endregion
+        const text = code === "REQUEST_TIMEOUT" ? "打开超时。" : "原位打开未完成。";
+        void panel.webview.postMessage({ kind: "status", text });
+        void broker.health().then(health => {
+          if (health.nativeHost && ++this.traceEvents <= 1024) this.output.appendLine(JSON.stringify({ nativeHost: health.nativeHost }));
+        }).catch(() => {});
+        void close();
+        return;
+      }
+      if (opened.opened !== true || opened.mode !== "embedded" || opened.inplace !== true || typeof opened.officeId !== "string") {
+        void panel.webview.postMessage({ kind: "status", text: "原位打开未完成。" });
+        void close();
+        return;
+      }
+      officeId = opened.officeId;
+      // #region agent log
+      fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "A", location: "extension.ts:attached", message: "embedded_opened", data: { mode: opened.mode, inplace: opened.inplace, application: opened.application, elapsedMs: Math.round(performance.now() - started) }, timestamp: Date.now() }) }).catch(() => {});
+      // #endregion
+      if (closed || this.disposed) { await broker.detachOfficeWindow(officeId); return; }
+      await layout(bounds);
+      await panel.webview.postMessage({ kind: "attached" });
+      await keepOfficeTab();
+      trace("attached");
+    }, false);
   }
 
   private async openInOffice(argument?: unknown): Promise<void> {
     assertLocalAccess();
     const uri = await this.chooseDocument(argument);
     if (!uri) return;
-    const broker = await this.connect();
-    const result = await broker.openInOffice(uri.fsPath);
-    if (result.opened !== true || result.mode !== "external") throw new OfficeBridgeError("INVALID_RESPONSE");
-    this.announce("已请求本机已安装的 Microsoft Office 在独立窗口打开所选文件。");
+    await (await this.connect()).openInOffice(uri.fsPath, "external");
   }
 
   private async pickOffice(argument?: unknown): Promise<OfficeInstance | undefined> {
@@ -324,9 +541,9 @@ class OfficeExtension implements vscode.Disposable {
   }
 
   private async pickChat(chats: RegisteredChat[], delivery = true): Promise<RegisteredChat | undefined> {
-    const available = delivery ? chats.filter(chat => chat.online !== false) : chats;
+    const available = chats;
     if (!available.length) {
-      this.announce("没有可用的已登记聊天；请先在目标聊天调用 office_register_chat 并打开 MCP App。");
+      this.announce("没有可用的已登记聊天；请先在目标聊天调用 office_register_chat。");
       return undefined;
     }
     const selected = await vscode.window.showQuickPick(available.map(chat => ({
@@ -468,10 +685,11 @@ class OfficeExtension implements vscode.Disposable {
   getDiagnostics(): OfficeExtensionDiagnostics {
     return {
       version: displayText(this.context.extension.packageJSON.version, 64),
+      loading: this.loading,
       hostKind: hostKind(),
       mcpMode: this.mcp.status.mode,
       capabilities: {
-        nativeOfficeEmbedding: false,
+        nativeOfficeEmbedding: true,
         nativeAutoSaveLocalRedirect: false,
         panelEditing: false,
         agentOperations: "core-whitelist",
@@ -486,11 +704,13 @@ class OfficeExtension implements vscode.Disposable {
   shutdown(): Promise<void> {
     this.shutdownPromise ??= (async () => {
       this.disposed = true;
+      await Promise.allSettled([...this.officeClosers].map(close => close()));
       this.statusMessage?.dispose();
       this.mcp.dispose();
       if (this.lease) {
         try { await this.broker.unregisterHost(this.lease); }
         catch { /* A closed broker is already detached. Never start a worker while shutting down. */ }
+        this.broker.bindHost(undefined);
       }
     })();
     return this.shutdownPromise;
@@ -502,11 +722,12 @@ class OfficeExtension implements vscode.Disposable {
 let activeExtension: OfficeExtension | undefined;
 
 export interface OfficeExtensionDiagnostics {
+  loading?: { stage: string; elapsedMs: number };
   version: string;
   hostKind: "vscode" | "cursor";
   mcpMode: import("./mcp").McpRegistrationStatus["mode"];
   capabilities: {
-    nativeOfficeEmbedding: false;
+    nativeOfficeEmbedding: boolean;
     nativeAutoSaveLocalRedirect: false;
     panelEditing: false;
     agentOperations: "core-whitelist";

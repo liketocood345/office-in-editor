@@ -6,7 +6,7 @@ import * as net from "node:net";
 import * as path from "node:path";
 import { TextDecoder } from "node:util";
 import { OfficeBridgeError } from "./errors";
-import { DEFAULT_TIMEOUT_MS, MAX_LINE_BYTES, encodeRequest, parseEndpoint, parseResponse } from "./protocol";
+import { CORE_START_TIMEOUT_MS, DEFAULT_TIMEOUT_MS, MAX_LINE_BYTES, MAX_PIPE_TIMEOUT_MS, encodeRequest, parseEndpoint, parseResponse } from "./protocol";
 import type { BrokerMethod, BrokerTransport, CoreEndpoint } from "./types";
 
 export interface CoreLocationOptions {
@@ -32,7 +32,7 @@ export async function readCoreEndpoint(executable: string, ensureBroker = false)
   const stdout = await new Promise<string>((resolve, reject) => {
     execFile(executable, [ensureBroker ? "--ensure-broker" : "--endpoint"], {
       windowsHide: true,
-      timeout: DEFAULT_TIMEOUT_MS,
+      timeout: ensureBroker ? CORE_START_TIMEOUT_MS : DEFAULT_TIMEOUT_MS,
       maxBuffer: 16 * 1024,
       encoding: "utf8",
       cwd: path.dirname(executable),
@@ -123,7 +123,7 @@ export async function requestPipe<T>(
     };
     const timer = setTimeout(
       () => finish(new OfficeBridgeError("REQUEST_TIMEOUT", connected)),
-      Math.max(250, Math.min(timeoutMs, 30_000)),
+      Math.max(250, Math.min(timeoutMs, MAX_PIPE_TIMEOUT_MS)),
     );
     socket.on("connect", () => {
       connected = true;

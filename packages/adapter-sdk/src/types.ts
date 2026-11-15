@@ -7,10 +7,11 @@ export interface CoreEndpoint {
 }
 
 export interface CoreHealth {
+  nativeHost?: { lastFailure: string; trace: { stage: string; elapsedMs: number }[] };
   version: string;
   protocolVersion: 1;
   capabilities: {
-    nativeOfficeEmbedding: false;
+    nativeOfficeEmbedding: boolean;
     nativeAutoSaveLocalRedirect: false;
     documentWrite: boolean;
     [key: string]: unknown;
@@ -19,6 +20,15 @@ export interface CoreHealth {
 }
 
 export type OfficeApplication = "word" | "excel" | "powerpoint";
+
+export interface HostBounds {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  visible?: boolean;
+  surfaceToken?: string;
+}
 
 export interface OfficeInstance {
   officeId: string;
@@ -89,9 +99,17 @@ export type BrokerMethod =
   | "health"
   | "host.register"
   | "host.unregister"
+  | "host.wait_delivery"
   | "office.list"
   | "office.capture"
   | "office.open"
+  | "office.describe_window"
+  | "office.attach_window"
+  | "office.layout_window"
+  | "office.detach_window"
+  | "office.save_window"
+  | "office.configure_save_window"
+  | "office.status_window"
   | "reference.list"
   | "reference.get"
   | "reference.release"

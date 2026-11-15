@@ -18,13 +18,24 @@ public static class Program
     {
         try
         {
-            CheckRibbon(); CheckReadOnlyCapture(); CheckSecurity(); CheckWire(); CheckCallback(); CheckEdits();
+            CheckRibbon(); CheckReadOnlyCapture(); CheckSecurity(); CheckWire(); CheckCancelledDispatch(); CheckCallback(); CheckEdits(); CheckWindowHost(); CheckLocalAutoSave(); CheckEmbeddedBindings(); CheckRouteCache();
             Console.WriteLine("Office add-in smoke passed: " + assertions + " assertions; no Office activation or registration.");
             return 0;
         }
-        catch (Exception error) { Console.Error.WriteLine("Smoke failed: " + error.GetType().Name); return 1; }
+        catch (Exception error)
+        {
+            Console.Error.WriteLine("Smoke failed: " + error.GetType().Name + ": " + error.Message);
+            if (error.InnerException != null)
+                Console.Error.WriteLine("Inner: " + error.InnerException.GetType().Name + ": " + error.InnerException.Message);
+            Console.Error.WriteLine(error.StackTrace);
+            return 1;
+        }
     }
-    private static void Assert(bool ok) { assertions++; if (!ok) throw new Exception("Assertion failed"); }
+    private static void Assert(bool ok, [System.Runtime.CompilerServices.CallerLineNumber] int line = 0)
+    {
+        assertions++;
+        if (!ok) throw new Exception("Assertion failed at line " + line);
+    }
     private static void CheckRibbon()
     {
         XNamespace ns = "http://schemas.microsoft.com/office/2009/07/customui";
@@ -48,6 +59,38 @@ public static class Program
         Assert(OfficeAddin.DetectApplication("Microsoft Excel") == "excel");
         Assert(OfficeAddin.DetectApplication("Microsoft PowerPoint") == "powerpoint");
         Assert(OfficeAddin.DetectApplication("Other app") == "unsupported");
+        Assert(RibbonMarkup.FromRibbonId("Microsoft.Word.Document") == "word");
+        Assert(RibbonMarkup.FromRibbonId("Microsoft.Excel.Workbook") == "excel");
+        Assert(RibbonMarkup.FromRibbonId("Microsoft.PowerPoint.Presentation") == "powerpoint");
+        Assert(RibbonMarkup.FromRibbonId("") == "unsupported");
+        var word = XDocument.Parse(RibbonMarkup.Build("word"));
+        var wordMenus = new List<string>();
+        foreach (var menu in word.Descendants(ns + "contextMenu"))
+            wordMenus.Add((string)menu.Attribute("idMso"));
+        Assert(wordMenus.Count == 1 && wordMenus[0] == "ContextMenuText");
+        Assert(RibbonMarkup.Build("word").Contains("OieTab"));
+        Assert(!RibbonMarkup.Build("word").Contains("ContextMenuHeading"));
+        var addin = new OfficeAddin();
+        var fallback = addin.GetCustomUI(null);
+        Assert(fallback.Contains("OieTab"));
+        Assert(!fallback.Contains("ContextMenuHeading"));
+        var byRibbonId = addin.GetCustomUI("Microsoft.Word.Document");
+        Assert(byRibbonId.Contains("OieTab"));
+        Assert(byRibbonId.Contains("ContextMenuText"));
+        Assert(!byRibbonId.Contains("ContextMenuHeading"));
+        Assert(byRibbonId.Contains("onAction=\"RefreshChats\""));
+        Assert(byRibbonId.Contains("onAction=\"AddToChat\""));
+        Assert(byRibbonId.Contains("idMso=\"FileSave\""));
+        Assert(byRibbonId.Contains("onAction=\"RepurposeFileSave\""));
+        Assert(!byRibbonId.Contains("AutoSave"));
+        Assert(!byRibbonId.Contains("MCP App"));
+        Assert(!byRibbonId.Contains("OieSaveOnEdit"));
+        Assert(byRibbonId.Contains("invalidateContentOnDrop=\"true\""));
+        Assert(addin.GetStatusLabel(null) == "");
+        addin.ChooseChat("missing-chat-id");
+        Assert(addin.GetStatusLabel(null) == "");
+        addin.RefreshChats(null);
+        addin.AddToChat(null);
     }
     private static void CheckReadOnlyCapture()
     {
@@ -63,6 +106,10 @@ public static class Program
         app.Selection.Range.Text = "changed";
         Assert((string)first["text"] == "sample"); // immutable captured string, not live selection
         Assert((string)Json.Map(capture.Capture())["documentId"] == identity);
+        Assert((string)Json.Map(capture.Capture(identity))["documentId"] == identity);
+        var another = new FakeDocument(); app.Documents.Add(another); app.ActiveDocument = another; app.Selection.Range.Document = another;
+        Expect("DOCUMENT_CHANGED", () => capture.Capture(identity));
+        app.ActiveDocument = app.Documents.Item(1); app.Selection.Range.Document = app.ActiveDocument;
         app.Selection.Range.End = 0;
         Expect("NO_SELECTION", () => capture.Capture());
         app.Selection.Range.End = SelectionCapture.MaxSelectionBytes;
@@ -88,6 +135,85 @@ public static class Program
         var oversized = new MemoryStream(new byte[Wire.MaxLineBytes + 1]);
         Expect("REQUEST_TOO_LARGE", () => Wire.ReadLineAsync(oversized, CancellationToken.None).GetAwaiter().GetResult());
     }
+    private static void CheckCancelledDispatch()
+    {
+        int calls = 0;
+        using (var dispatcher = new OfficeDispatcher())
+        using (var cancel = new CancellationTokenSource())
+        {
+            cancel.Cancel();
+            for (int index = 0; index < 100; index++)
+            {
+                var task = Task.Run(() => dispatcher.InvokeAsync(() => ++calls, cancel.Token));
+                try { task.GetAwaiter().GetResult(); } catch (OperationCanceledException) { }
+                Assert(task.IsCanceled);
+                Assert(dispatcher.PendingCount == 0);
+            }
+        }
+        // Any queued native APC now targets the process-rooted no-op thunk.
+        Application.DoEvents(); Thread.Sleep(1);
+        Assert(calls == 0);
+    }
+
+    private static void CheckLocalAutoSave()
+    {
+        string fixture = Path.Combine(Path.GetTempPath(), "oie-autosave-" + Guid.NewGuid().ToString("N") + ".docx");
+        File.WriteAllText(fixture, "Fake Office save policy fixture");
+        try
+        {
+            var application = new AutoSaveApplication();
+            var doc = application.ActiveDocument;
+            doc.FullName = fixture;
+            long now = 0; int reports = 0;
+            using (var dispatcher = new OfficeDispatcher())
+            using (var save = new LocalAutoSave(application, "word", dispatcher, _ => reports++, () => now, false))
+            {
+                save.Check(); Assert(doc.SaveCalls == 0);
+                Assert(!save.Periodic); save.Configure(false, 60); save.Check();
+                now = 2000; save.Check(); Assert(doc.SaveCalls == 0);
+                doc.Saved = false; save.Configure(true, 5); save.Check();
+                now += 4999; save.Check(); Assert(doc.SaveCalls == 0);
+                now++; save.Check(); Assert(doc.SaveCalls == 1);
+                save.Configure(false, 5); doc.Saved = false;
+                now += 60000; save.Check(); Assert(doc.SaveCalls == 1);
+                save.Configure(true, 60); save.Check();
+                now += 60_000; save.Check(); Assert(doc.SaveCalls == 2);
+                doc.ReadOnly = false; doc.Saved = false; application.FailCommand = true;
+                save.Configure(true, 5); save.Check(); now += 5000; save.Check(); save.Check();
+                Assert(doc.SaveCalls == 2 && reports == 1); // failed FileSave does not fall back to Save()
+                application.FailCommand = false;
+                save.Configure(true, 5); doc.Saved = false; save.Check(); now += 5000; save.Check();
+                Assert(doc.SaveCalls == 3);
+                doc.Saved = false; File.AppendAllText(fixture, " external change");
+                now += 60_000; save.Check(); save.Check();
+                Assert(doc.SaveCalls == 3); Assert(reports == 2);
+                save.Configure(true, 60); doc.ReadOnly = true; doc.Saved = false; save.Check();
+                now += 60_000; save.Check(); Assert(doc.SaveCalls == 3);
+            }
+            Assert(!LocalAutoSave.LocalPath("https://example.test/file.docx", "word"));
+            Assert(!LocalAutoSave.LocalPath("Unsaved.docx", "word"));
+            Assert(!LocalAutoSave.LocalPath(fixture, "excel"));
+            foreach (string kind in new[] { "excel", "powerpoint" })
+            {
+                string other = Path.ChangeExtension(fixture, kind == "excel" ? ".xlsx" : ".pptx");
+                File.WriteAllText(other, "Fake Office format-specific policy fixture");
+                try
+                {
+                    var app = new AutoSaveApplication(); app.ActiveDocument.FullName = other;
+                    long elapsed = 0;
+                    using (var dispatcher = new OfficeDispatcher())
+                    using (var save = new LocalAutoSave(app, kind, dispatcher, _ => { }, () => elapsed, false))
+                    {
+                        save.Configure(true, 60); save.Check();
+                        elapsed = 60_000; save.Check(); Assert(app.ActiveDocument.SaveCalls == 1);
+                    }
+                }
+                finally { File.Delete(other); }
+            }
+        }
+        finally { File.Delete(fixture); }
+    }
+
     private static void CheckCallback()
     {
         string name = "office-in-editor-smoke-" + Guid.NewGuid().ToString("N");
@@ -112,15 +238,53 @@ public static class Program
             Assert(Json.Text(Json.Get(rejected.Result, "error"), "code") == "METHOD_NOT_FOUND");
             Assert(calls == 1);
         }
+        using (var dispatcher = new OfficeDispatcher())
+        {
+            int windowCalls = 0;
+            using (var windows = new OfficeCallbackServer(name + "-window", dispatcher, (method, parameters) =>
+                {
+                    windowCalls++;
+                    if (method == "describeWindow") return Json.Object("hwnd", "1", "processId", 1, "attached", false);
+                    if (method == "attachWindow")
+                    {
+                        Assert(Convert.ToInt32(Json.Get(parameters, "width")) >= 32);
+                        return Json.Object("attached", true, "hwnd", "1");
+                    }
+                    throw new BridgeException("METHOD_NOT_FOUND");
+                }))
+            {
+                windows.Start();
+                var described = Task.Run(() => Request(name + "-window", "describeWindow"));
+                PumpUntil(described);
+                Assert(Json.IsTrue(Json.Get(described.Result, "ok")));
+                var attached = Task.Run(() => Request(name + "-window", "attachWindow", Json.Object("x", 0, "y", 0, "width", 640, "height", 480)));
+                PumpUntil(attached);
+                Assert(Json.Text(Json.Get(attached.Result, "error"), "code") == "METHOD_NOT_FOUND" || Json.IsTrue(Json.Get(attached.Result, "ok")));
+            }
+            Assert(windowCalls >= 1);
+        }
     }
-    private static object Request(string pipe, string method)
+    private static void CheckWindowHost()
+    {
+        var host = new WindowHost();
+        var app = new WindowedWord();
+        var described = Json.Map(host.DescribeWindow(app));
+        Assert(described["hwnd"] is string);
+        Assert(!(bool)described["attached"]);
+        Expect("INVALID_HOST_WINDOW", () => host.Attach(Json.Object("x", 0, "y", 0, "width", 1, "height", 1), app));
+        Expect("INVALID_HOST_WINDOW", () => host.Attach(Json.Object("x", 0, "y", 0, "width", "wide", "height", 100), app));
+        var detached = Json.Map(host.Detach(app));
+        Assert(!(bool)detached["attached"]);
+        host.RestoreAll();
+    }
+    private static object Request(string pipe, string method, object parameters = null)
     {
         using (var cancel = new CancellationTokenSource(5000))
         using (var client = new NamedPipeClientStream(".", pipe, PipeDirection.InOut, PipeOptions.Asynchronous))
         {
             client.Connect(3000);
             Wire.WriteLineAsync(client, Json.Object("v", 1, "id", "smoke", "method", method,
-                "params", Json.Object()), cancel.Token).GetAwaiter().GetResult();
+                "params", parameters ?? Json.Object()), cancel.Token).GetAwaiter().GetResult();
             return Json.Serializer().DeserializeObject(Wire.ReadLineAsync(client, cancel.Token).GetAwaiter().GetResult());
         }
     }
@@ -160,6 +324,13 @@ public static class Program
         wordApp.ActiveDocument.FullName = Path.Combine(Path.GetPathRoot(Path.GetTempPath()), "oie-smoke.docx");
         word.Dispatch("saveDocument", Json.Object("documentId", id));
         Assert(wordApp.ActiveDocument.SaveCalls == 1);
+        wordApp.ActiveDocument.Protection = 3;
+        var protectedInfo = Json.Map(word.Dispatch("inspectDocument", Json.Object("documentId", id)));
+        Assert(((string[])Json.Get(protectedInfo["capabilities"], "writeKinds")).Length == 0);
+        Expect("DOCUMENT_PROTECTED", () => word.Dispatch("prepareEdit", Json.Object("documentId", id, "operation", insert)));
+        wordApp.ActiveDocument.UnknownProtection = true;
+        Expect("DOCUMENT_PROTECTION_UNKNOWN", () => word.Dispatch("prepareEdit", Json.Object("documentId", id, "operation", insert)));
+        wordApp.ActiveDocument.UnknownProtection = false; wordApp.ActiveDocument.Protection = -1;
 
         var excelApp = new EditableExcel();
         var excel = new DocumentOperations(excelApp, "excel", new SelectionCapture(excelApp, "excel", "excel-smoke").Documents);
@@ -196,6 +367,56 @@ public static class Program
             "afterHash", slideApplied["afterHash"], "result", slideApplied["result"]));
         Assert(pptApp.ActivePresentation.Slides.Count == 0);
     }
+    private static void CheckEmbeddedBindings()
+    {
+        string firstPath = Path.Combine(Path.GetTempPath(), "oie-binding-" + Guid.NewGuid().ToString("N") + ".docx");
+        string secondPath = Path.ChangeExtension(firstPath, ".second.docx");
+        File.WriteAllText(firstPath, "first fake"); File.WriteAllText(secondPath, "second fake");
+        try
+        {
+            var app = new EditableWord(); var first = app.ActiveDocument; var second = new EditableDocument();
+            string firstSession = "ole-" + Guid.NewGuid().ToString("N"), secondSession = "ole-" + Guid.NewGuid().ToString("N");
+            bool live = true;
+            var embedded = new EmbeddedDocumentBindings(hwnd => hwnd == 1 ? first : second, _ => live);
+            var registry = new DocumentRegistry(app, "word", "binding-smoke", embedded);
+            embedded.Update(Json.Object("bindings", new[] {
+                Json.Object("sessionId", firstSession, "sourcePath", firstPath, "hwnd", "1", "sourceVerified", true),
+                Json.Object("sessionId", secondSession, "sourcePath", secondPath, "hwnd", "2", "sourceVerified", true) }));
+            Assert(registry.OpenDocuments().Count == 2);
+            string firstId = registry.Bind(first), secondId = registry.Bind(second);
+            Assert(firstId != secondId && registry.Bind(first) == firstId);
+            Assert(ReferenceEquals(registry.Resolve(secondId), second));
+            Assert(Json.Text(registry.Describe(first), "sourcePath") == firstPath);
+            Assert(Json.Text(registry.Describe(second), "sessionId") == secondSession);
+            var operations = new DocumentOperations(app, "word", registry);
+            var requested = operations.Dispatch("saveDocument", Json.Object("documentId", secondId));
+            Assert(Json.IsTrue(Json.Get(requested, "requiresHostSave")) && !Json.IsTrue(Json.Get(requested, "saved")));
+            Assert(Json.Text(requested, "sessionId") == secondSession && second.SaveCalls == 0 && first.SaveCalls == 0);
+            using (var dispatcher = new OfficeDispatcher())
+            using (var autosave = new LocalAutoSave(app, "word", dispatcher, _ => { }, () => 60000, false, registry))
+            { autosave.Configure(true, 5); autosave.Check(); Assert(first.SaveCalls == 0); }
+            live = false;
+            Expect("DOCUMENT_CLOSED", () => registry.Resolve(secondId));
+            Assert(embedded.Find(first) == null);
+        }
+        finally { File.Delete(firstPath); File.Delete(secondPath); }
+    }
+    private static void CheckRouteCache()
+    {
+        var cache = new ChatRouteCache();
+        Assert(cache.Bind("doc-a", "session-a", "chat-a", "A", "epoch-a", 2, "broker-a"));
+        Assert(cache.Bind("doc-b", "session-b", "chat-b", "B", "epoch-b", 1, "broker-a"));
+        Assert(!cache.Bind("doc-a", "session-a", "stale", "stale", "old", 1, "broker-a"));
+        Assert(cache.For("doc-a").Id == "chat-a" && cache.For("doc-b").Id == "chat-b");
+        cache.For("doc-a").Manual = true; cache.For("doc-a").Id = null;
+        Assert(cache.For("doc-a").Manual && cache.For("doc-b").Id == "chat-b");
+        Assert(cache.Bind("doc-a", "session-a", "new", "New", "new-epoch", 3, "broker-a"));
+        Assert(!cache.For("doc-a").Manual);
+        Assert(cache.Bind("doc-a", "session-a", "restart", "Restart", "restart-epoch", 1, "broker-b"));
+        Assert(cache.For("doc-b").Id == null);
+        Assert(!cache.Bind("doc-a", "session-a", "late", "Late", "late-epoch", 99, "broker-a"));
+        Assert(cache.For("doc-a").Id == "restart");
+    }
     private static void Expect(string code, Action action)
     {
         try { action(); throw new Exception("Expected rejection"); }
@@ -204,13 +425,50 @@ public static class Program
 }
 
 // Test doubles only. No COM activation, Office process access or document writes.
+public sealed class AutoSaveApplication
+{
+    public AutoSaveDocument ActiveDocument { get; } = new AutoSaveDocument();
+    public AutoSaveDocument ActiveWorkbook => ActiveDocument;
+    public AutoSaveDocument ActivePresentation => ActiveDocument;
+    public bool FailCommand;
+    public AutoSaveCommands CommandBars => new AutoSaveCommands(ActiveDocument, FailCommand);
+}
+public sealed class AutoSaveCommands
+{
+    private readonly AutoSaveDocument document;
+    private readonly bool fail;
+    public AutoSaveCommands(AutoSaveDocument document, bool fail) { this.document = document; this.fail = fail; }
+    public void ExecuteMso(string id) { if (id != "FileSave" || fail) throw new InvalidOperationException(); document.Save(); }
+}
+public sealed class AutoSaveDocument
+{
+    public string FullName { get; set; }
+    public bool Saved { get; set; }
+    public bool ReadOnly { get; set; }
+    public int ProtectionType => -1;
+    public int SaveCalls { get; private set; }
+    public void Save() { SaveCalls++; Saved = true; }
+}
+public sealed class WindowedWord
+{
+    public int Hwnd => 1;
+}
+
 public sealed class FakeWord
 {
-    public FakeCount Documents { get; } = new FakeCount();
-    public FakeDocument ActiveDocument { get; } = new FakeDocument();
+    public FakeCount Documents { get; }
+    public FakeDocument ActiveDocument { get; set; } = new FakeDocument();
     public FakeSelection Selection { get; } = new FakeSelection();
+    public FakeWord() { Documents = new FakeCount(ActiveDocument); Selection.Range.Document = ActiveDocument; }
 }
-public sealed class FakeCount { public int Count => 1; }
+public sealed class FakeCount
+{
+    private readonly List<FakeDocument> documents = new List<FakeDocument>();
+    public FakeCount(FakeDocument document) { documents.Add(document); }
+    public int Count => documents.Count;
+    public void Add(FakeDocument document) { documents.Add(document); }
+    public FakeDocument Item(int index) => documents[index - 1];
+}
 public sealed class FakeSelection { public FakeRange Range { get; } = new FakeRange(); }
 public sealed class FakeRange
 {
@@ -219,6 +477,7 @@ public sealed class FakeRange
     public int End { get; set; } = 6;
     public int StoryType => 1;
     public bool ThrowOnText { get; set; }
+    public object Document { get; set; }
     public string Text { get { if (ThrowOnText) throw new Exception(); return text; } set { text = value; } }
 }
 public sealed class FakeDocument
@@ -234,7 +493,22 @@ public sealed class EditableWord
 {
     public EditableDocument ActiveDocument { get; } = new EditableDocument();
     public EditableDocuments Documents { get; }
-    public EditableWord() { Documents = new EditableDocuments(ActiveDocument); }
+    public EditableCommands CommandBars { get; }
+    public EditableWord()
+    {
+        Documents = new EditableDocuments(ActiveDocument);
+        CommandBars = new EditableCommands(ActiveDocument);
+    }
+}
+public sealed class EditableCommands
+{
+    private readonly EditableDocument document;
+    public EditableCommands(EditableDocument document) { this.document = document; }
+    public void ExecuteMso(string id)
+    {
+        if (id != "FileSave") throw new InvalidOperationException();
+        document.Save();
+    }
 }
 public sealed class EditableDocuments
 {
@@ -250,7 +524,9 @@ public sealed class EditableDocument
     public string FullName { get; set; } = "Unsaved notes";
     public bool Saved { get; set; } = true;
     public bool ReadOnly => false;
-    public int ProtectionType => -1;
+    public int Protection = -1;
+    public bool UnknownProtection;
+    public int ProtectionType => UnknownProtection ? throw new NotSupportedException() : Protection;
     public int SaveCalls { get; private set; }
     public EditableContent Content { get; }
     public bool AutoSaveOn { get => throw new NotSupportedException(); }

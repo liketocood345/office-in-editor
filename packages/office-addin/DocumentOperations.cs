@@ -227,41 +227,24 @@ namespace OfficeInEditor.OfficeAddin
             dynamic document = string.IsNullOrEmpty(Json.Text(parameters, "documentId"))
                 ? Active() : documents.Resolve(Json.Text(parameters, "documentId"));
             if (!CanManualSave(document)) throw new BridgeException("MANUAL_SAVE_UNAVAILABLE");
-            document.Save();
+            var embedded = documents.Embedded.Find((object)document);
+            if (embedded != null)
+                return Json.Object("documentId", documents.Bind(document), "sessionId", embedded.SessionId,
+                    "saved", false, "requiresHostSave", true, "intent", "manual_save");
+            string path = Convert.ToString(document.FullName, CultureInfo.InvariantCulture);
+            if (kind == "word") LocalAutoSave.ClickSave(application, (object)document, path, kind);
+            else LocalAutoSave.Save((object)document, path);
             return Json.Object("documentId", documents.Bind(document), "saved", true, "intent", "manual_save");
         }
 
         private object Active()
         {
-            dynamic document;
-            switch (kind)
-            {
-                case "word":
-                    if (Convert.ToInt32(application.Documents.Count, CultureInfo.InvariantCulture) == 0) throw new BridgeException("NO_DOCUMENT");
-                    document = application.ActiveDocument; break;
-                case "excel":
-                    if (Convert.ToInt32(application.Workbooks.Count, CultureInfo.InvariantCulture) == 0) throw new BridgeException("NO_DOCUMENT");
-                    document = application.ActiveWorkbook; break;
-                case "powerpoint":
-                    if (Convert.ToInt32(application.Presentations.Count, CultureInfo.InvariantCulture) == 0) throw new BridgeException("NO_DOCUMENT");
-                    document = application.ActivePresentation; break;
-                default: throw new BridgeException("UNSUPPORTED_APPLICATION");
-            }
-            documents.Bind(document);
-            return document;
+            return documents.Active();
         }
 
         private Dictionary<string, object> Describe(dynamic document)
         {
-            string name = Convert.ToString(document.Name, CultureInfo.InvariantCulture);
-            if (string.IsNullOrEmpty(name) || name.Length > 256) throw new BridgeException("INVALID_DOCUMENT");
-            bool dirty = true;
-            string state;
-            try { dirty = !Convert.ToBoolean(document.Saved, CultureInfo.InvariantCulture); } catch { }
-            try { state = Convert.ToBoolean(document.AutoSaveOn, CultureInfo.InvariantCulture) ? "enabled" : "off_or_unavailable"; }
-            catch { state = "unsupported"; }
-            return Json.Object("application", kind, "documentId", documents.Bind(document), "documentName", name,
-                "dirty", dirty, "autoSaveState", state, "nativeAutoSaveLocalRedirect", false, "nativeEmbedding", false);
+            return documents.Describe((object)document);
         }
 
         private Dictionary<string, object> Summary(dynamic document)
@@ -274,14 +257,15 @@ namespace OfficeInEditor.OfficeAddin
         private Dictionary<string, object> Capabilities(dynamic document)
         {
             var kinds = new List<string>();
-            if (!IsReadOnly(document))
+            bool writable = IsWritable(document);
+            if (writable)
             {
                 if (kind == "word") kinds.Add("word.insert_text");
                 if (kind == "excel") { kinds.Add("excel.set_range_values"); kinds.Add("excel.set_range_formulas"); }
                 if (kind == "powerpoint") { kinds.Add("powerpoint.add_slide"); kinds.Add("powerpoint.add_textbox"); }
             }
-            return Json.Object("writeKinds", kinds.ToArray(), "manualSave", CanManualSave(document), "revert", !IsReadOnly(document),
-                "nativeEmbedding", false, "nativeAutoSaveLocalRedirect", false);
+            return Json.Object("writeKinds", kinds.ToArray(), "manualSave", CanManualSave(document), "revert", writable,
+                "nativeEmbedding", documents.Embedded.Find((object)document) != null, "nativeAutoSaveLocalRedirect", false);
         }
 
         private bool Supports(string name)
@@ -551,8 +535,9 @@ namespace OfficeInEditor.OfficeAddin
 
         private static int RequiredInt(object args, string name) => Convert.ToInt32(Json.Get(args, name), CultureInfo.InvariantCulture);
 
-        private static void RequireWritable(dynamic document)
+        private void RequireWritable(dynamic document)
         {
+            if (kind == "word") { LocalAutoSave.RequireWordWritable((object)document); return; }
             if (IsReadOnly(document)) throw new BridgeException("DOCUMENT_PROTECTED");
             try
             {
@@ -564,14 +549,18 @@ namespace OfficeInEditor.OfficeAddin
             catch { }
         }
 
+        private bool IsWritable(dynamic document) { try { RequireWritable(document); return true; } catch { return false; } }
         private static bool IsReadOnly(dynamic document)
         {
             try { return Convert.ToBoolean(document.ReadOnly, CultureInfo.InvariantCulture); }
             catch { return false; }
         }
 
-        private static bool CanManualSave(dynamic document)
+        private bool CanManualSave(dynamic document)
         {
+            if (kind == "word" && !IsWritable(document)) return false;
+            var embedded = documents.Embedded.Find((object)document);
+            if (embedded != null) return embedded.SourceVerified;
             if (IsReadOnly(document)) return false;
             string fullName;
             try { fullName = Convert.ToString(document.FullName, CultureInfo.InvariantCulture); }

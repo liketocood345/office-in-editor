@@ -18,7 +18,7 @@ try {
   }
   const capabilityResult = await client.callTool({ name: 'office_capabilities', arguments: {} });
   const capability = JSON.parse(capabilityResult.content.find(item => item.type === 'text').text);
-  assert.equal(capability.capabilities.nativeOfficeEmbedding, false);
+  assert.equal(capability.capabilities.nativeOfficeEmbedding, true);
   assert.equal(capability.capabilities.nativeAutoSaveLocalRedirect, false);
   const registered = await client.callTool({ name: 'office_register_chat', arguments: { label: 'Integration fixture' } });
   const appMeta = registered._meta?.officeInEditor;

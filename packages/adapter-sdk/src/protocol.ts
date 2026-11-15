@@ -3,6 +3,9 @@ import type { BrokerMethod, CoreEndpoint } from "./types";
 
 export const MAX_LINE_BYTES = 2 * 1024 * 1024;
 export const DEFAULT_TIMEOUT_MS = 10_000;
+export const CORE_START_TIMEOUT_MS = 25_000;
+export const OPEN_DOCUMENT_TIMEOUT_MS = 60_000;
+export const MAX_PIPE_TIMEOUT_MS = 60_000;
 export const PIPE_NAME_PATTERN = /^office-in-editor-v1-[a-f0-9]{16}$/u;
 
 export function parseEndpoint(stdout: string): CoreEndpoint {

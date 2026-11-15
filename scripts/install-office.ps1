@@ -6,6 +6,7 @@ param(
     [switch]$ValidateOnly
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'installation-common.ps1')
 $addinClsid = '{6B4072D4-3EB1-4CAB-995D-4F922B19D4B1}'
 $addinProgId = 'OfficeInEditor.Addin'
 $addinClass = 'OfficeInEditor.OfficeAddin.OfficeAddin'
@@ -81,7 +82,7 @@ try {
     foreach ($serverPath in @(($clsidPath + '\InprocServer32'), ($clsidPath + '\InprocServer32\' + $assemblyName.Version.ToString()))) {
         $server = $userRegistry.CreateSubKey($serverPath)
         try {
-            $server.SetValue('', 'mscoree.dll'); $server.SetValue('ThreadingModel', 'Both')
+            $server.SetValue('', 'mscoree.dll'); $server.SetValue('ThreadingModel', 'Apartment')
             $server.SetValue('Class', $addinClass); $server.SetValue('Assembly', $assemblyName.FullName)
             $server.SetValue('RuntimeVersion', 'v4.0.30319'); $server.SetValue('CodeBase', $codeBase)
         } finally { $server.Dispose() }
@@ -105,5 +106,13 @@ try {
             $appKey.SetValue('CommandLineSafe', 0, [Microsoft.Win32.RegistryValueKind]::DWord)
         } finally { $appKey.Dispose() }
     }
-    [pscustomobject]@{ Registered = $true; OfficeBitness = $OfficeBitness; ActivatedOffice = $false; ExistingOfficeSessions = 'unchanged; add-in loads on a subsequent launch' }
+    $disabled = Clear-OieDisabledItems -SkipIfOfficeRunning
+    [pscustomobject]@{
+      Registered = $true
+      OfficeBitness = $OfficeBitness
+      ActivatedOffice = $false
+      ExistingOfficeSessions = 'unchanged; add-in loads on a subsequent launch'
+      DisabledItemsCleared = [int]$disabled.Cleared
+      DisabledItemsSkipped = [bool]$disabled.Skipped
+    }
 } finally { $userRegistry.Dispose() }

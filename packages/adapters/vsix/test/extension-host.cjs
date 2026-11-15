@@ -20,7 +20,7 @@ async function run() {
     "Stage the Core payload and use a host with the public MCP registration API.");
   assert.equal(diagnostics.version, manifest.version);
   assert.deepEqual(diagnostics.capabilities, {
-    nativeOfficeEmbedding: false,
+    nativeOfficeEmbedding: true,
     nativeAutoSaveLocalRedirect: false,
     panelEditing: false,
     agentOperations: "core-whitelist",
@@ -40,27 +40,8 @@ async function run() {
     "exportReference", "showReference",
   ]) assert.ok(commands.has("officeInEditor." + name), "Missing public extension command: " + name);
 
-  const temporaryRoot = await fs.mkdtemp(path.join(os.tmpdir(), "office-in-editor-extension-test-"));
-  const before = new Set(vscode.window.tabGroups.all.flatMap(group => group.tabs));
-  const createdTabs = [];
-  try {
-    const fixture = path.join(temporaryRoot, "session-control-fixture.docx");
-    // The control tab validates only existence and file type. These bytes are never sent to Office.
-    await fs.writeFile(fixture, "Office In Editor session control fixture; not an Office editing document.", "utf8");
-    await vscode.commands.executeCommand("officeInEditor.openDocument", vscode.Uri.file(fixture));
-    createdTabs.push(...vscode.window.tabGroups.all.flatMap(group => group.tabs).filter(tab => !before.has(tab)));
-    const sessionTab = createdTabs.find(tab =>
-      tab.input instanceof vscode.TabInputWebview && tab.input.viewType.includes("officeInEditor.session"));
-    assert.ok(sessionTab, "Open Document must create a session/control webview.");
-    assert.match(sessionTab.label, /会话控制/u);
-    assert.equal(api.getDiagnostics().capabilities.nativeOfficeEmbedding, false);
-  } finally {
-    for (const tab of createdTabs) await vscode.window.tabGroups.close(tab, true);
-    const resolvedTemporary = await fs.realpath(temporaryRoot);
-    const resolvedBase = await fs.realpath(os.tmpdir());
-    assert.ok(resolvedTemporary.startsWith(resolvedBase + path.sep), "Fixture cleanup must stay within the temp root.");
-    await fs.rm(resolvedTemporary, { recursive: true, force: true });
-  }
+  // Native document open is exercised separately with valid isolated Office fixtures.
+  // This extension-host smoke only verifies registration and redacted diagnostics.
 }
 
 module.exports = { run };

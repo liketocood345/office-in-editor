@@ -9,9 +9,9 @@ using System.Security.Cryptography;
 using System.Security.Principal;
 using System.Text;
 using System.Threading;
+using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using System.Web.Script.Serialization;
-using System.Windows.Forms;
 
 namespace OfficeInEditor.OfficeAddin
 {
@@ -143,40 +143,98 @@ namespace OfficeInEditor.OfficeAddin
 
     internal sealed class OfficeDispatcher : IDisposable
     {
-        private readonly Control control;
+        private const uint ThreadSetContext = 0x0010;
+        private readonly Dictionary<int, Action> pending = new Dictionary<int, Action>();
         private readonly int threadId;
+        private readonly IntPtr threadHandle;
+        private static readonly ApcCallback apc = ExecuteApc;
+        private static readonly Dictionary<int, OfficeDispatcher> owners = new Dictionary<int, OfficeDispatcher>();
+        private static int nextOwner;
+        private readonly int ownerToken;
+        private bool wakeQueued;
+        internal int PendingCount { get { lock (pending) return pending.Count; } }
+        private int next;
         private volatile bool disposed;
         internal OfficeDispatcher()
         {
             threadId = Thread.CurrentThread.ManagedThreadId;
             if (Thread.CurrentThread.GetApartmentState() != ApartmentState.STA)
                 throw new BridgeException("OFFICE_STA_REQUIRED");
-            control = new Control();
-            // An invisible dispatch HWND owned by the existing Office UI thread, never a visible app window.
-            var handle = control.Handle;
+            threadHandle = OpenThread(ThreadSetContext, false, GetCurrentThreadId());
+            if (threadHandle == IntPtr.Zero) throw new BridgeException("OFFICE_STA_REQUIRED");
+            ownerToken = Interlocked.Increment(ref nextOwner);
+            lock (owners) owners[ownerToken] = this;
+        }
+        internal void Execute(int token)
+        {
+            Action work;
+            lock (pending)
+            {
+                if (!pending.TryGetValue(token, out work)) return;
+                pending.Remove(token);
+            }
+            work();
+        }
+        private static void ExecuteApc(UIntPtr token)
+        {
+            OfficeDispatcher owner;
+            lock (owners) if (!owners.TryGetValue(unchecked((int)token.ToUInt32()), out owner)) return;
+            int[] work;
+            lock (owner.pending) { work = new int[owner.pending.Count]; owner.pending.Keys.CopyTo(work, 0); owner.wakeQueued = false; }
+            foreach (int item in work) try { owner.Execute(item); } catch { }
         }
         internal async Task<T> InvokeAsync<T>(Func<T> callback, CancellationToken cancel)
         {
             if (disposed) throw new BridgeException("OFFICE_DISCONNECTED");
             if (Thread.CurrentThread.ManagedThreadId == threadId) return callback();
             var completion = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
-            using (cancel.Register(() => completion.TrySetCanceled()))
+            int token;
+            bool schedule;
+            lock (pending)
             {
-                control.BeginInvoke((Action)(() =>
+                    if (disposed) throw new BridgeException("OFFICE_DISCONNECTED");
+                    if (pending.Count >= 32) throw new BridgeException("OFFICE_BUSY");
+                    token = ++next;
+                    pending[token] = () =>
+                    {
+                        if (disposed || cancel.IsCancellationRequested) { completion.TrySetCanceled(); return; }
+                        try { completion.TrySetResult(callback()); }
+                        catch (Exception error) { completion.TrySetException(error); }
+                    };
+                    schedule = !wakeQueued;
+                    wakeQueued = true;
+            }
+            using (cancel.Register(() => { lock (pending) pending.Remove(token); completion.TrySetCanceled(); }))
+            {
+                if (schedule && QueueUserAPC(apc, threadHandle, new UIntPtr(unchecked((uint)ownerToken))) == 0)
                 {
-                    if (disposed || cancel.IsCancellationRequested) { completion.TrySetCanceled(); return; }
-                    try { completion.TrySetResult(callback()); }
-                    catch (Exception error) { completion.TrySetException(error); }
-                }));
+                    lock (pending) { pending.Remove(token); wakeQueued = false; }
+                    throw new BridgeException("OFFICE_DISCONNECTED");
+                }
                 return await completion.Task.ConfigureAwait(false);
             }
         }
         public void Dispose()
         {
+            if (disposed) return;
             disposed = true;
-            if (Thread.CurrentThread.ManagedThreadId == threadId) control.Dispose();
-            else try { control.BeginInvoke((Action)(() => control.Dispose())); } catch { }
+            lock (owners) owners.Remove(ownerToken);
+            if (threadHandle != IntPtr.Zero) try { CloseHandle(threadHandle); } catch { }
+            List<Action> abandoned;
+            lock (pending) { abandoned = new List<Action>(pending.Values); pending.Clear(); }
+            foreach (var work in abandoned) try { work(); } catch { }
         }
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        private delegate void ApcCallback(UIntPtr parameter);
+        [DllImport("kernel32.dll")]
+        private static extern uint GetCurrentThreadId();
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr OpenThread(uint access, bool inherit, uint threadId);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern uint QueueUserAPC(ApcCallback callback, IntPtr thread, UIntPtr data);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr handle);
     }
 
     internal sealed class OfficeCallbackServer : IDisposable

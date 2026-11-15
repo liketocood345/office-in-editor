@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.IO.Pipes;
 using System.Net;
 using System.Net.Http.Headers;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json.Nodes;
 using OfficeInEditor.Core;
@@ -28,8 +29,37 @@ try
     Check(!Directory.Exists(testRoot), "construction does not create storage");
     Task<JsonNode?> Call(string method, JsonNode? value = null) => state.InvokeAsync(method, value, Environment.ProcessId, CancellationToken.None);
     var health = await Call("health");
-    Check(health?["capabilities"]?["nativeOfficeEmbedding"]?.GetValue<bool>() == false && health?["capabilities"]?["nativeAutoSaveLocalRedirect"]?.GetValue<bool>() == false, "unsupported capabilities are explicit");
-    Check((await Call("office.route.get"))?["mode"]?.GetValue<string>() == "standalone", "no guessed embedded route");
+    Check(health?["capabilities"]?["nativeOfficeEmbedding"]?.GetValue<bool>() == true && health?["capabilities"]?["nativeAutoSaveLocalRedirect"]?.GetValue<bool>() == false, "native embedding is the Core OLE host; native AutoSave redirect stays unsupported");
+    Check((await Call("office.route.get"))?["mode"]?.GetValue<string>() == "embedded" &&
+        (await Call("office.route.get"))?["reason"]?.GetValue<string>() == "core_ole_document_host" &&
+        (await Call("office.route.get"))?["supported"]?.GetValue<bool>() == true &&
+        (await Call("office.route.get"))?["lastOleFailure"]?.GetValue<string>() == "", "embedded route uses the Core OLE document host");
+    Check(OleDocumentHost.TryMap(Path.Combine("fixtures", "note.docx"), out var mappedApp, out var mappedProg) && mappedApp == "word" && mappedProg == "Word.Document", "docx maps to Word.Document");
+    Check(OleDocumentHost.TryMap(Path.Combine("fixtures", "sheet.xlsx"), out mappedApp, out mappedProg) && mappedApp == "excel", "xlsx maps to Excel");
+    Check(OleDocumentHost.TryMap(Path.Combine("fixtures", "board.vsdx"), out mappedApp, out mappedProg) && mappedApp == "visio", "vsdx maps to Visio");
+    Check(OleDocumentHost.TryMap(Path.Combine("fixtures", "notes.one"), out mappedApp, out mappedProg) && mappedApp == "onenote", "one maps to OneNote");
+    Check(!OleDocumentHost.TryMap(Path.Combine("fixtures", "note.txt"), out _, out _), "non-Office paths are rejected before OLE create");
+    Check(!OleDocumentHost.TryMap(Path.Combine("fixtures", "mail.msg"), out _, out _), "Outlook message files stay out of the editor");
+    Check(OfficeDocumentKind.IsDeniedExtension(".pst") && OfficeDocumentKind.IsDeniedServer("OUTLOOK.EXE") && OfficeDocumentKind.IsDeniedServer("OneDrive.exe"), "mail and sync hosts are denied");
+    Check(OfficeDocumentKind.TryClassify(Path.Combine("fixtures", "note.docx"), out var wordKind) && OfficeDocumentKind.TryClassify(Path.Combine("fixtures", "sheet.xlsx"), out var excelKind) && wordKind.Key != excelKind.Key, "Word and Excel are distinct kind keys");
+    Check(WebviewSurface.IsToken("oie-surface-" + new string('a', 32)) && !WebviewSurface.IsToken("oie-surface-nope"), "webview surface tokens are the planted custom-editor id");
+    Check(WebviewSurface.ToClient(100, 80, 860, 916, 7, 40) == (93, 40, 860, 916), "nested child coords are relative to the webview parent client origin");
+    Check(!WebviewSurface.IsEditorWebview(IntPtr.Zero) && !WebviewSurface.IsTightEditorHost(new WebviewSurface.Placement(IntPtr.Zero, 214, 102, 860, 916, "uia-mapped")), "workbench-sized mapped parents are not a tight editor webview");
+    Check(WebviewSurface.TryBounds(new double[] { 10, 20, 400, 300 }, out var bx, out var by, out var bw, out var bh) && bx == 10 && by == 20 && bw == 400 && bh == 300, "uia bounds arrays are left,top,width,height");
+    var uia = UiaCom.Create();
+    Console.WriteLine("UIA create hr=0x" + UiaCom.LastCreateHr.ToString("X8") + " how=" + UiaCom.LastCreateHow + " obj=" + (uia is not null));
+    Check(uia is not null && UiaCom.LastCreateHr == 0, "CUIAutomation coclass can be created");
+    if (uia is not null && Marshal.IsComObject(uia)) Marshal.ReleaseComObject(uia);
+    Check(!OleDocumentHost.HasSession, "process tests do not leave an OLE session");
+    Directory.CreateDirectory(testRoot);
+    var blockedFixture = Path.Combine(testRoot, "blocked.docx");
+    File.WriteAllText(blockedFixture, "This fixture must never reach Office.");
+    try { NativeOfficeLauncher.Open(blockedFixture, "embedded"); Check(false, "unsafe embedding must reject"); }
+    catch (CoreFault error) { Check(error.Code == "invalid_host_window", "embedded open requires a tab rectangle before OLE"); }
+    try { NativeOfficeLauncher.Open(blockedFixture, "embedded", true); Check(false, "fallback must not start Office from a tab embed"); }
+    catch (CoreFault error) { Check(error.Code == "invalid_host_window", "embedded fallback still never starts an Office process"); }
+    Check(!OleDocumentHost.HasSession, "rejected native open creates no OLE session");
+    File.Delete(blockedFixture);
 
     var host = await Call("host.register", Wire.Node(new { hostId = "test-host", kind = "vscode", label = "Test host" }));
     Check((await Call("host.list"))?.AsArray().Count == 1, "host registration");
@@ -37,6 +67,13 @@ try
     var target = await Call("chat.register", Wire.Node(new { ownerId = "test-owner", hostId = "test-host", label = "Test chat" }));
     var targetId = target!["id"]!.GetValue<string>(); var token = target["token"]!.GetValue<string>();
     Check(!(await Call("chat.list"))!.ToJsonString().Contains(token, StringComparison.Ordinal), "chat directory never returns tokens");
+    Check((await Call("chat.defaultTarget"))?["id"]?.GetValue<string>() == targetId, "sole registered chat is the default target");
+    var later = await Call("chat.register", Wire.Node(new { ownerId = "test-owner", hostId = "test-host", label = "Later chat" }));
+    var laterId = later!["id"]!.GetValue<string>(); var laterToken = later["token"]!.GetValue<string>();
+    Check((await Call("chat.defaultTarget"))?["id"]?.GetValue<string>() == laterId, "newer register is latest activity");
+    Check((await Call("routing.touch", Wire.Node(new { ownerId = "test-owner", targetId })))?["targetId"]?.GetValue<string>() == targetId, "touch records the initiating chat");
+    Check((await Call("chat.defaultTarget"))?["id"]?.GetValue<string>() == targetId, "touch makes that chat the latest activity");
+    Check((await Call("routing.touch", Wire.Node(new { ownerId = "nobody" })))?["bound"]?.GetValue<bool>() == false, "unknown owner is silent");
     Check((await Call("runtime.shutdownIfIdle"))?["status"]?.GetValue<string>() == "busy", "busy shutdown does not affect owners");
 
     await using var app = new AppServer(state);
@@ -59,6 +96,8 @@ try
     var delivered = await Call("reference.deliverSelection", deliveryArgs);
     var refId = delivered!["reference"]!["refId"]!.GetValue<string>();
     Check(delivered["delivery"]?["status"]?.GetValue<string>() == "queued", "queued is not attached");
+    var hostPush = await Call("host.wait_delivery", Wire.Node(new { hostId = "test-host", lease = host!["lease"]!.GetValue<string>() }));
+    Check(hostPush?["refId"]?.GetValue<string>() == refId && hostPush?["text"]?.GetValue<string>() == text && hostPush?["sourcePath"] is null, "host wait_delivery receives the selection without the source path");
     var replay = await Call("reference.deliverSelection", deliveryArgs);
     Check(replay?["reference"]?["refId"]?.GetValue<string>() == refId && (await Call("reference.list"))?.AsArray().Count == 1, "repeated right-click request captures once");
     await Fault(async () => { await Call("reference.deliverSelection", Wire.Node(new { selection = Selection("different"), targetId, requestId = "delivery-test-1" })); }, "idempotency_conflict");
@@ -105,6 +144,7 @@ try
     await Fault(async () => { await Call("reference.deliverSelection", deliveryArgs); }, "reference_not_found");
     Check((await Call("reference.list"))?.AsArray().Count == 1, "released request cannot capture again");
     await Call("office.unregister", Wire.Node(new { officeId = "test-office" }));
+    await Call("chat.unregister", Wire.Node(new { targetId = laterId, ownerId = "test-owner", token = laterToken }));
     await Call("chat.unregister", Wire.Node(new { targetId, ownerId = "test-owner", token }));
     await Call("host.unregister", Wire.Node(new { hostId = "test-host", lease = host!["lease"]!.GetValue<string>() }));
     var stopped = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously); state.BecameIdle += () => stopped.TrySetResult();

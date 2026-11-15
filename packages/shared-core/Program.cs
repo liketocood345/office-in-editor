@@ -1,5 +1,8 @@
 using System.IO.Pipes;
+using System.Runtime.CompilerServices;
 using System.Text.Json.Nodes;
+
+[assembly: InternalsVisibleTo("OfficeInEditor.Core.Tests")]
 
 namespace OfficeInEditor.Core;
 
@@ -10,6 +13,7 @@ public static class Program
         try
         {
             if (!OperatingSystem.IsWindows()) throw new CoreFault("unsupported_platform", "This private worker requires Windows.");
+            NativeWindow.TryEnableDpi();
             switch (args.FirstOrDefault())
             {
                 case "--endpoint":
@@ -100,8 +104,9 @@ public static class Program
         await using (pipe)
         {
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(stopped);
-            timeout.CancelAfter(TimeSpan.FromSeconds(55));
+            timeout.CancelAfter(TimeSpan.FromSeconds(65));
             JsonNode? id = null;
+            var method = "";
             try
             {
                 var line = await Wire.ReadLineAsync(pipe, timeout.Token);
@@ -109,11 +114,14 @@ public static class Program
                 var request = JsonNode.Parse(line) ?? throw new CoreFault("invalid_request", "Request is invalid.");
                 id = request["id"]?.DeepClone();
                 if (Wire.Number(request, "v") != 1) throw new CoreFault("protocol_mismatch", "Protocol version is unsupported.");
-                var result = await state.InvokeAsync(Wire.Text(request, "method"), request["params"], WindowsPipePeer.ProcessId(pipe), timeout.Token);
+                method = Wire.Text(request, "method");
+                var result = await state.InvokeAsync(method, request["params"], WindowsPipePeer.ProcessId(pipe), timeout.Token);
                 await Wire.WriteAsync(pipe, new { id, ok = true, result }, timeout.Token);
             }
             catch (Exception error)
             {
+                // Failed office.open aborts only its own site in OleDocumentHost. Do not
+                // AbortOrphan sibling tabs or other Office kinds.
                 try
                 {
                     var fault = error as CoreFault;

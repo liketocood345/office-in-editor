@@ -58,6 +58,7 @@ foreach($entry in $plan){
 if(-not $PSCmdlet.ShouldProcess('Current-user Office in Editor components','Install or repair verified plugin components')){return}
 New-Item -Path $root -ItemType Directory -Force|Out-Null
 if(-not $record){$record=[pscustomobject]@{productId='office-in-editor';version='0.1.0';files=@();hosts=@();officeRegistered=$false}}
+$record.version=[Reflection.AssemblyName]::GetAssemblyName((Join-Path $PayloadRoot 'core/OfficeInEditor.Core.dll')).Version.ToString(3)
 $record|Add-Member -NotePropertyName transactionState -NotePropertyValue 'installing' -Force
 $record|Add-Member -NotePropertyName pendingFiles -NotePropertyValue @($plan.ToArray()|ForEach-Object{[ordered]@{relativePath=$_.relativePath;sha256=$_.sha256}}) -Force
 # Durable ownership intent precedes copying. It survives interruption without unowned orphan directories.
@@ -93,7 +94,7 @@ try{
   $record.pendingFiles=@();Save-OieManifest $manifestPath $record
 }catch{
   $record.transactionState='pending-repair';Save-OieManifest $manifestPath $record
-  throw 'Installation did not fully complete; owned state was preserved for repair. No Office process was closed.'
+  throw ('Installation did not fully complete; owned state was preserved for repair. No Office process was closed. ' + $_.Exception.Message)
 }
 $results.ToArray()|ConvertTo-Json -Depth 6
 Write-Output 'Installation finished without closing Office/editors. DSH is deferred in this release.'

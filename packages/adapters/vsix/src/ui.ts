@@ -16,7 +16,11 @@ export function panelHtml(title: string, body: string): string {
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}'; base-uri 'none'; form-action 'none'">
 <title>${escapeHtml(title)}</title>
 <style nonce="${nonce}">
-body{font-family:var(--vscode-font-family);padding:24px;max-width:960px;line-height:1.65;color:var(--vscode-foreground);background:var(--vscode-editor-background)}
+html,body{margin:0;height:100%;width:100%;overflow:hidden;background:var(--vscode-editor-background);color:var(--vscode-foreground)}
+body{font-family:var(--vscode-font-family);padding:24px;max-width:960px;line-height:1.65}
+body.host{padding:0;max-width:none}
+.host-status{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;padding:24px;text-align:center}
+.host-ready{position:absolute;inset:0;background:transparent}
 h1{font-size:1.6em}h2{font-size:1.1em;margin-top:24px}
 .notice{border-left:3px solid var(--vscode-focusBorder);padding:10px 16px;background:var(--vscode-textBlockQuote-background)}
 .actions{display:flex;gap:10px;flex-wrap:wrap;margin:20px 0}
@@ -34,6 +38,85 @@ for(const button of document.querySelectorAll('button[data-action]')){
 </script></body></html>`;
 }
 
-export function capabilitiesNotice(): string {
-  return '<p class="notice">本版本提供 Office 会话与协作控制标签页。Office 编辑窗口尚未嵌入编辑器；Office AutoSave 尚未重定向到本地。此控制标签页不直接编辑文档；模型可通过 MCP 调用 Core 已声明的 Office 原生白名单操作。具体能力以 Core 为准，引用不会自动提交聊天。</p>';
+export function hostHtml(
+  title: string,
+  message: string,
+  surfaceToken: string,
+  appearance?: { background: string; foreground: string },
+): string {
+  void title;
+  const nonce = randomBytes(18).toString("base64");
+  const token = escapeHtml(surfaceToken);
+  const background = escapeHtml(appearance?.background || "#FFFFFF");
+  const foreground = escapeHtml(appearance?.foreground || "#201F1E");
+  return `<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}'; base-uri 'none'; form-action 'none'">
+<title>${token}</title>
+<style nonce="${nonce}">
+html,body,#ole-root{margin:0;height:100%;width:100%;overflow:hidden;background:${background};color:${foreground}}
+#ole-root{position:absolute;inset:0}
+.host-status{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;padding:24px;text-align:center;color:${foreground};font-family:var(--vscode-font-family)}
+.host-ready{position:absolute;inset:0}
+.oie-beacon{position:absolute;width:1px;height:1px;padding:0;margin:0;border:0;border-radius:0;pointer-events:none;z-index:3;background:#000}
+.oie-beacon[data-oie-beacon="tl"]{left:0;top:0}
+.oie-beacon[data-oie-beacon="tr"]{right:0;top:0}
+.oie-beacon[data-oie-beacon="bl"]{left:0;bottom:0}
+.oie-beacon[data-oie-beacon="br"]{right:0;bottom:0}
+[hidden]{display:none!important}
+</style></head><body>
+<div id="ole-root" class="ole-root" role="application" aria-label="${token}" title="${token}" data-oie-surface="${token}">
+<div class="oie-beacon" data-oie-beacon="tl" role="img" aria-label="${token}:tl"></div>
+<div class="oie-beacon" data-oie-beacon="tr" role="img" aria-label="${token}:tr"></div>
+<div class="oie-beacon" data-oie-beacon="bl" role="img" aria-label="${token}:bl"></div>
+<div class="oie-beacon" data-oie-beacon="br" role="img" aria-label="${token}:br"></div>
+<div id="status" class="host-status"${message ? "" : " hidden"}>${escapeHtml(message)}</div>
+<div id="surface" class="host-ready" hidden></div>
+</div>
+<script nonce="${nonce}">
+(()=>{
+const api=acquireVsCodeApi();
+const surfaceToken=${JSON.stringify(surfaceToken)};
+document.title=surfaceToken;
+const root=document.getElementById('ole-root');
+const statusNode=document.getElementById('status');
+const surface=document.getElementById('surface');
+let acknowledged=false;
+window.addEventListener('error',()=>api.postMessage({action:'script-error'}));
+api.postMessage({action:'ready'});
+window.addEventListener('message',event=>{
+  const data=event.data||{};
+  if(data.kind==='layout-ack') acknowledged=true;
+  if(data.kind==='layout-request') report();
+  if(data.kind==='theme'&&typeof data.background==='string'&&typeof data.foreground==='string'){
+    document.documentElement.style.background=data.background;
+    document.body.style.background=data.background;
+    document.body.style.color=data.foreground;
+    if(root){root.style.background=data.background;root.style.color=data.foreground;}
+    statusNode.style.color=data.foreground;
+  }
+  if(data.kind==='status'&&typeof data.text==='string'){
+    statusNode.textContent=data.text;
+    statusNode.hidden=false;
+    surface.hidden=true;
+  }
+  if(data.kind==='attached'){
+    statusNode.hidden=true;
+    surface.hidden=false;
+  }
+});
+function report(){
+  const viewport=window.visualViewport;
+  const width=Math.round((viewport&&viewport.width)||window.innerWidth||0);
+  const height=Math.round((viewport&&viewport.height)||window.innerHeight||0);
+  const dpr=window.devicePixelRatio||1;
+  api.postMessage({action:'layout',surfaceToken,width,height,x:0,y:0,dpr,clientOnly:true});
+}
+window.addEventListener('resize',report);
+new ResizeObserver(report).observe(document.body);
+for(const delay of [100,300,750,1500]) setTimeout(()=>{if(!acknowledged)report();},delay);
+report();
+})();
+</script></body></html>`;
 }

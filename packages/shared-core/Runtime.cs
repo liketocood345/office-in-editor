@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.IO;
 using System.IO.Pipes;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
@@ -60,7 +61,7 @@ public static class Wire
 
 public static class RuntimeIdentity
 {
-    public const string Version = "0.1.0";
+    public const string Version = "0.1.4";
     public static string UserKey => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(
         WindowsIdentity.GetCurrent().User?.Value ?? throw new CoreFault("identity_unavailable", "Windows identity is unavailable."))))[..16].ToLowerInvariant();
     public static string PipeName => "office-in-editor-v1-" + UserKey;
@@ -179,4 +180,45 @@ public sealed class ProcessLease : IDisposable
         process.Exited -= Exited;
         process.Dispose();
     }
+}
+
+internal static class DebugNdjson
+{
+    private const int Capacity = 64;
+    private static readonly object Gate = new();
+    private static readonly Queue<object> Events = new();
+    private static readonly System.Net.Http.HttpClient Http = new() { Timeout = TimeSpan.FromMilliseconds(250) };
+    private const string Ingest = "http://127.0.0.1:7884/ingest/93344ccb-bd6f-4fa7-8e2d-f58c925f8e0b";
+
+    internal static void Write(string hypothesisId, string location, string message, object? data)
+    {
+        var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        try
+        {
+            var line = System.Text.Json.JsonSerializer.Serialize(new
+            {
+                sessionId = "4dd893",
+                hypothesisId,
+                location,
+                message,
+                data,
+                timestamp
+            });
+            var request = new System.Net.Http.HttpRequestMessage(System.Net.Http.HttpMethod.Post, Ingest)
+            {
+                Content = new System.Net.Http.StringContent(line, Encoding.UTF8, "application/json")
+            };
+            request.Headers.TryAddWithoutValidation("X-Debug-Session-Id", "4dd893");
+            _ = Http.SendAsync(request);
+        }
+        catch { /* Debug ingest must never block Office. */ }
+        if (!AppContext.TryGetSwitch("OfficeInEditor.Diagnostics", out var enabled) || !enabled) return;
+        lock (Gate)
+        {
+            if (Events.Count == Capacity) Events.Dequeue();
+            Events.Enqueue(new { hypothesisId, location, message, timestamp });
+        }
+    }
+
+    internal static object[] Snapshot() { lock (Gate) return Events.ToArray(); }
 }

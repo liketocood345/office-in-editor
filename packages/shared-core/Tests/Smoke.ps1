@@ -53,7 +53,7 @@ try {
     $tools = Invoke-Mcp 2 'tools/list' @{}
     if ($tools.tools.Count -ne 13) { throw 'MCP tool inventory failed.' }
     $health = Invoke-Pipe $endpoint.pipeName 'health' @{}
-    if ($health.owners.mcp -lt 1 -or $health.capabilities.nativeOfficeEmbedding -ne $false) { throw 'MCP ownership or capabilities failed.' }
+    if ($health.owners.mcp -lt 1 -or $health.capabilities.nativeOfficeEmbedding -ne $true) { throw 'MCP ownership or capabilities failed.' }
     $registration = Invoke-Mcp 3 'tools/call' @{name='office_register_chat';arguments=@{label='Core smoke target'}}
     $token = $registration._meta.officeInEditor.token
     if (!$token -or ($registration.content | ConvertTo-Json -Compress).Contains($token) -or ($registration.structuredContent | ConvertTo-Json -Compress).Contains($token)) { throw 'App token isolation failed.' }

@@ -21,6 +21,9 @@ public sealed partial class CoreState : IAsyncDisposable
     private readonly Dictionary<string, Delivery> deliveries = new(StringComparer.Ordinal);
     private readonly Dictionary<string, Deduplication> deduplication = new(StringComparer.Ordinal);
     private readonly Dictionary<string, RuntimeOwner> runtimeOwners = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, string> ownerCurrentChat = new(StringComparer.Ordinal);
+    private readonly string brokerEpoch = Guid.NewGuid().ToString("N");
+    private long activitySequence;
     private readonly Timer idleTimer;
     private readonly OperationJournal operations;
     private long referenceBytes;
@@ -32,15 +35,24 @@ public sealed partial class CoreState : IAsyncDisposable
     public event Action? BecameIdle;
 
     private sealed record Reference(string Id, JsonObject Selection, string CreatedAt, string Hash, long Bytes);
-    private sealed record Host(string Id, string Kind, string Label, string Lease, string Epoch, ProcessLease Owner);
-    private sealed record Office(string Id, string Application, string PipeName, int Pid, string RegisteredAt, string Registration, ProcessLease Owner);
+    private sealed class Host
+    {
+        public required string Id, Kind, Label, Lease, Epoch;
+        public required ProcessLease Owner;
+        public Channel<JsonObject> Deliveries { get; } = Channel.CreateBounded<JsonObject>(
+            new BoundedChannelOptions(8) { FullMode = BoundedChannelFullMode.DropOldest });
+    }
+    private sealed record Office(string Id, string Application, string PipeName, int Pid, string RegisteredAt, string Registration, ProcessLease Owner, bool Embedded);
     private sealed record RuntimeOwner(string Id, string Lease, ProcessLease Process);
     private sealed class Chat
     {
         public required string Id, OwnerId, Label, HostId, Epoch, Token;
         public required ProcessLease Owner;
+        public DateTimeOffset LastActivity { get; set; } = DateTimeOffset.UtcNow;
+        public long ActivitySequence;
         public Channel<bool> Signals { get; } = Channel.CreateBounded<bool>(new BoundedChannelOptions(1) { FullMode = BoundedChannelFullMode.DropWrite });
         public bool Connected;
+        public string ConnectionId = "";
     }
     private sealed class Delivery
     {
@@ -57,15 +69,17 @@ public sealed partial class CoreState : IAsyncDisposable
         idleTimer = new Timer(_ =>
         {
             lock (sync)
-                if (!disposed && activeRequests == 0 && hosts.Count == 0 && offices.Count == 0 && chats.Count == 0 && runtimeOwners.Count == 0)
+                if (!disposed && activeRequests == 0 && NoPersistentWork())
                     BecameIdle?.Invoke();
         });
         LoadReferences();
     }
+    private bool NoPersistentWork() =>
+        hosts.Count == 0 && offices.Count == 0 && chats.Count == 0 && runtimeOwners.Count == 0 && !OleDocumentHost.HasSession;
     public void ScheduleIdleShutdown()
     {
         lock (sync)
-            if (!disposed) idleTimer.Change(hosts.Count + offices.Count + chats.Count + runtimeOwners.Count + activeRequests == 0 ?
+            if (!disposed) idleTimer.Change(NoPersistentWork() && activeRequests == 0 ?
                 (shutdownRequested ? TimeSpan.FromMilliseconds(250) : TimeSpan.FromSeconds(20)) : Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
     }
     private static string Timestamp() => DateTimeOffset.UtcNow.ToString("O");
@@ -86,9 +100,66 @@ public sealed partial class CoreState : IAsyncDisposable
                 catch (Exception) { throw new CoreFault("office_capture_unavailable", "Office could not capture a selection. No reference was created."); }
                 lock (sync) return Metadata(Capture(selection));
             }
-            if (method == "office.open") return NativeOfficeLauncher.Open(Wire.Text(parameters, "path", 32767));
+            if (method == "office.source.resolve")
+            {
+                Office sourceOffice;
+                lock (sync) sourceOffice = GetOffice(Wire.Text(parameters, "officeId"));
+                if (sourceOffice.Pid != ownerPid) throw new CoreFault("unauthorized", "Source bindings are restricted to the owning Office process.");
+                return OleDocumentHost.SourceBindingsForProcess(ownerPid);
+            }
+            if (method == "office.open")
+            {
+                // #region agent log
+                DebugNdjson.Write("F", "CoreState.InvokeAsync", "office_open_params", new
+                {
+                    hasPath = parameters?["path"] is not null,
+                    mode = Wire.Text(parameters, "mode", 16, false),
+                    hasHostId = parameters?["hostId"] is not null,
+                    hasHostLease = parameters?["hostLease"] is not null,
+                    hasHostEpoch = parameters?["hostEpoch"] is not null,
+                    hasSessionId = parameters?["sessionId"] is not null,
+                    width = Wire.Number(parameters, "width"),
+                    height = Wire.Number(parameters, "height")
+                });
+                // #endregion
+                lock (sync) ValidateOpeningHost(parameters, ownerPid);
+                var opened = await Task.Run(() => NativeOfficeLauncher.Open(
+                Wire.Text(parameters, "path", 32767),
+                Wire.Text(parameters, "mode", 16, false) is { Length: > 0 } requested ? requested : "external",
+                Wire.OptionalBoolean(parameters, "fallback") ?? false,
+                Wire.Number(parameters, "x"), Wire.Number(parameters, "y"),
+                Wire.Number(parameters, "width"), Wire.Number(parameters, "height"),
+                Wire.Text(parameters, "sessionId", 64, false) is { Length: > 0 } sessionId ? sessionId : null,
+                Wire.Text(parameters, "surfaceToken", 80, false) is { Length: > 0 } surfaceToken ? surfaceToken : null,
+                cancellation,
+                Wire.OptionalBoolean(parameters, "visible") ?? true,
+                ReadPixelRatio(parameters),
+                Wire.Text(parameters, "backupId", 64, false) is { Length: > 0 } backupId ? backupId : null));
+                lock (sync) RememberOpenedSession(parameters, opened, ownerPid);
+                Office[] targets;
+                lock (sync) targets = offices.Values.Where(item => item.Pid == Wire.Number(opened, "pid")).ToArray();
+                using var refreshDeadline = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
+                refreshDeadline.CancelAfter(TimeSpan.FromMilliseconds(500));
+                foreach (var target in targets)
+                    try { await PipeClient.CallAsync(target.PipeName, "refreshDocumentBindings", OleDocumentHost.SourceBindingsForProcess(target.Pid), refreshDeadline.Token); } catch { }
+                return opened;
+            }
+            if (method == "host.wait_delivery") return await WaitHostDeliveryAsync(parameters, ownerPid, cancellation);
+            if (method == "routing.touch") return await TouchRouteAsync(parameters, ownerPid, cancellation);
+            if (method == "routing.hook") return await HookActivityAsync(parameters, cancellation);
+            if (method == "reference.captureAndDeliver") return await CaptureAndDeliverAsync(parameters, ownerPid, cancellation);
             if (method is "office.inspect_document" or "office.apply_edit" or "office.revert_edit" or "office.save_document")
                 return await InvokeOfficeOperationAsync(method, parameters, cancellation);
+            if (method is "office.describe_window" or "office.attach_window" or "office.layout_window" or "office.detach_window" or "office.save_window" or "office.configure_save_window" or "office.status_window" or "office.backup_window" or "office.release_backup_window" or "office.revert_window")
+            {
+                lock (sync) ValidateSessionRequest(method, parameters, ownerPid);
+                if (OleDocumentHost.TryHandleWindow(method, parameters, out var oleWindow))
+                {
+                    if (method == "office.detach_window" && Wire.Boolean(oleWindow, "closed")) lock (sync) ForgetSession(Wire.Text(parameters, "officeId", 160));
+                    return oleWindow;
+                }
+                return await InvokeOfficeWindowAsync(method, parameters, cancellation);
+            }
             lock (sync)
             {
                 return method switch
@@ -104,11 +175,14 @@ public sealed partial class CoreState : IAsyncDisposable
                     "host.list" => Wire.Node(hosts.Values.Select(item => new { hostId = item.Id, kind = item.Kind, label = item.Label }).ToArray()),
                     "chat.register" => RegisterChat(parameters, ownerPid),
                     "chat.list" => Wire.Node(chats.Values.Select(PublicChat).ToArray()),
+                    "chat.defaultTarget" => DefaultTarget(),
                     "chat.unregister" => UnregisterChat(parameters),
                     "office.register" => RegisterOffice(parameters, ownerPid),
+                    "office.document.bind" => BindDocument(parameters, ownerPid),
+                    "office.document.route" => DocumentRoute(parameters, ownerPid),
                     "office.unregister" => UnregisterOffice(parameters),
                     "office.list" => Wire.Node(offices.Values.Select(item => new { officeId = item.Id, application = item.Application, pid = item.Pid, registeredAt = item.RegisteredAt }).ToArray()),
-                    "office.route.get" => Wire.Node(new { mode = "standalone", supported = false, reason = "native_embedding_unavailable" }),
+                    "office.route.get" => Wire.Node(new { mode = "embedded", supported = true, reason = "core_ole_document_host", lastOleFailure = OleDocumentHost.LastFailure }),
                     "reference.capture" => Metadata(Capture(parameters?["selection"] ?? parameters)),
                     "reference.list" => new JsonArray(references.Values.OrderByDescending(item => item.CreatedAt).Select(Metadata).ToArray()),
                     "reference.get" => FullReference(GetReference(Wire.Text(parameters, "refId"))),
@@ -126,8 +200,10 @@ public sealed partial class CoreState : IAsyncDisposable
     private JsonNode? Health() => Wire.Node(new
     {
         protocolVersion = 1,
+        brokerEpoch,
         version = RuntimeIdentity.Version,
-        capabilities = new { nativeOfficeEmbedding = false, nativeAutoSaveLocalRedirect = false, documentWrite = true, documentWriteRequiresAdapterCapability = true, selectionCapture = true, mcpApps = true,
+        nativeHost = OleDocumentHost.Diagnostics,
+        capabilities = new { nativeOfficeEmbedding = true, nativeAutoSaveLocalRedirect = false, documentWrite = true, documentWriteRequiresAdapterCapability = true, selectionCapture = true, mcpApps = true, tabUiDoesNotLocateContent = true, agentEditsUseMcp = true,
             supportedWriteKinds = AllowedWriteKinds, manualSave = true, guardedRevert = true },
         appOrigin = AppOrigin,
         appPort = Uri.TryCreate(AppOrigin, UriKind.Absolute, out var appUri) ? appUri.Port : 0,
@@ -156,7 +232,7 @@ public sealed partial class CoreState : IAsyncDisposable
     }
     private JsonNode? ShutdownIfIdle()
     {
-        if (hosts.Count + offices.Count + chats.Count + runtimeOwners.Count != 0 || activeRequests > 1)
+        if (!NoPersistentWork() || activeRequests > 1)
             return Wire.Node(new { status = "busy" });
         shutdownRequested = true;
         return Wire.Node(new { status = "shutting_down" });
@@ -177,13 +253,16 @@ public sealed partial class CoreState : IAsyncDisposable
         var lease = Wire.NewToken(); var epoch = Guid.NewGuid().ToString("N");
         var owner = NewOwner(pid, () => RemoveHost(id, lease));
         if (hosts.Remove(id, out var old)) old.Owner.Dispose();
-        hosts[id] = new Host(id, kind, Wire.Text(value, "label", 160), lease, epoch, owner);
+        hosts[id] = new Host { Id = id, Kind = kind, Label = Wire.Text(value, "label", 160), Lease = lease, Epoch = epoch, Owner = owner };
         return Wire.Node(new { hostId = id, lease, epoch });
     }
     private void RemoveHost(string id, string? lease = null)
     {
         if (!hosts.TryGetValue(id, out var host) || lease is not null && host.Lease != lease) return;
-        hosts.Remove(id); host.Owner.Dispose();
+        hosts.Remove(id);
+        host.Deliveries.Writer.TryComplete();
+        host.Owner.Dispose();
+        foreach (var session in sessionOwners.Where(item => item.Value.HostId == id).ToArray()) ForgetSession(session.Key);
         foreach (var chat in chats.Values.Where(item => item.HostId == id).ToArray()) RemoveChat(chat.Id);
     }
     private JsonNode? UnregisterHost(JsonNode? value)
@@ -207,25 +286,33 @@ public sealed partial class CoreState : IAsyncDisposable
         var registration = Guid.NewGuid().ToString("N");
         var owner = NewOwner(pid, () => RemoveOffice(id, registration));
         if (offices.Remove(id, out var old)) old.Owner.Dispose();
-        offices[id] = new Office(id, application, pipeName, pid, Timestamp(), registration, owner);
+        offices[id] = new Office(id, application, pipeName, pid, Timestamp(), registration, owner, OleDocumentHost.IsServerPid(pid));
         return Wire.Node(new { officeId = id, registered = true });
     }
     private void RemoveOffice(string id, string? registration = null)
     {
-        if (offices.TryGetValue(id, out var office) && (registration is null || office.Registration == registration)) { offices.Remove(id); office.Owner.Dispose(); }
+        if (offices.TryGetValue(id, out var office) && (registration is null || office.Registration == registration))
+        {
+            offices.Remove(id); office.Owner.Dispose();
+            foreach (var key in documentBindings.Where(item => item.Value.OfficeId == id).Select(item => item.Key).ToArray())
+            { documentBindings.Remove(key); documentRoutes.Remove(key); }
+        }
     }
     private JsonNode? UnregisterOffice(JsonNode? value) { RemoveOffice(Wire.Text(value, "officeId", 128)); return Wire.Node(new { removed = true }); }
     private Office GetOffice(string id) => offices.TryGetValue(id, out var office) ? office : throw new CoreFault("office_unavailable", "The Office instance is unavailable.");
-    private static object PublicChat(Chat chat) => new { id = chat.Id, label = chat.Label, hostId = chat.HostId, epoch = chat.Epoch, ownerId = chat.OwnerId, online = true };
+    private static object PublicChat(Chat chat) => new { id = chat.Id, label = chat.Label, hostId = chat.HostId, epoch = chat.Epoch, ownerId = chat.OwnerId, online = chat.Connected };
     private JsonNode? RegisterChat(JsonNode? value, int pid)
     {
         if (chats.Count >= 32) throw new CoreFault("quota_exceeded", "Chat registration capacity is reached.");
         var hostId = Wire.Text(value, "hostId", 128, false);
         if (hostId != "" && !hosts.ContainsKey(hostId)) throw new CoreFault("host_unavailable", "The requested host is unavailable.");
+        var ownerId = Wire.Text(value, "ownerId", 160);
+        if (chats.Values.Any(item => item.OwnerId == ownerId && item.Owner.Pid != pid)) throw new CoreFault("unauthorized", "Chat owner belongs to another process.");
         var id = Guid.NewGuid().ToString("N");
         var chat = new Chat { Id = id, OwnerId = Wire.Text(value, "ownerId", 160), Label = Wire.Text(value, "label", 160), HostId = hostId,
             Epoch = Guid.NewGuid().ToString("N"), Token = Wire.NewToken(), Owner = NewOwner(pid, () => RemoveChat(id)) };
         chats.Add(id, chat);
+        MarkActivity(chat);
         var result = (JsonObject)Wire.Node(PublicChat(chat))!;
         result["token"] = chat.Token; result["appOrigin"] = AppOrigin;
         return result;
@@ -245,6 +332,7 @@ public sealed partial class CoreState : IAsyncDisposable
     private void RemoveChat(string id)
     {
         if (!chats.Remove(id, out var chat)) return;
+        if (ownerCurrentChat.TryGetValue(chat.OwnerId, out var current) && current == id) ownerCurrentChat.Remove(chat.OwnerId);
         chat.Signals.Writer.TryComplete(); chat.Owner.Dispose();
         foreach (var delivery in deliveries.Values.Where(item => item.TargetId == id && item.Status == "queued")) { delivery.Status = "failed"; delivery.LastError = "target_offline"; }
     }
@@ -346,6 +434,17 @@ public sealed partial class CoreState : IAsyncDisposable
     private static JsonNode DeliveryNode(Delivery delivery) => Wire.Node(new { requestId = delivery.RequestId, refId = delivery.RefId, targetId = delivery.TargetId,
         status = delivery.Status, createdAt = delivery.CreatedAt, lastError = delivery.LastError })!;
     private Chat ValidateTarget(string targetId) => chats.TryGetValue(targetId, out var target) ? target : throw new CoreFault("target_offline", "Select an online registered chat.");
+    private void MarkActivity(Chat chat)
+    {
+        chat.LastActivity = DateTimeOffset.UtcNow;
+        chat.ActivitySequence = ++activitySequence;
+        ownerCurrentChat[chat.OwnerId] = chat.Id;
+    }
+    private JsonNode? DefaultTarget()
+    {
+        var chat = chats.Values.OrderByDescending(item => item.ActivitySequence).FirstOrDefault();
+        return chat is null ? new JsonObject() : Wire.Node(PublicChat(chat));
+    }
     private Delivery Queue(string refId, string targetId, string requestId, string fingerprint)
     {
         var target = ValidateTarget(targetId);
@@ -360,8 +459,48 @@ public sealed partial class CoreState : IAsyncDisposable
             throw new CoreFault("quota_exceeded", "The bounded delivery queue is full.");
         var delivery = new Delivery { RequestId = requestId, RefId = refId, TargetId = targetId, CreatedAt = Timestamp() };
         deliveries.Add(requestId, delivery); deduplication.Add(requestId, new Deduplication(fingerprint, refId, targetId));
+        MarkActivity(target);
         target.Signals.Writer.TryWrite(true);
+        NotifyHost(target, delivery, refId);
         return delivery;
+    }
+    private void NotifyHost(Chat target, Delivery delivery, string refId)
+    {
+        if (target.HostId.Length == 0 || !hosts.TryGetValue(target.HostId, out var host)) return;
+        var reference = GetReference(refId);
+        static string Field(JsonObject selection, string key, int max)
+        {
+            var text = selection[key] is JsonValue scalar && scalar.TryGetValue<string>(out var value) ? value : "";
+            return text.Length > max ? text[..max] : text;
+        }
+        var node = Wire.Node(new
+        {
+            requestId = delivery.RequestId,
+            refId = delivery.RefId,
+            targetId = delivery.TargetId,
+            documentName = Field(reference.Selection, "documentName", 160),
+            kind = Field(reference.Selection, "kind", 32),
+            text = Field(reference.Selection, "text", 8192)
+        });
+        if (node is JsonObject payload) host.Deliveries.Writer.TryWrite(payload);
+    }
+    private async Task<JsonNode?> WaitHostDeliveryAsync(JsonNode? value, int pid, CancellationToken cancellation)
+    {
+        Host host;
+        lock (sync)
+        {
+            var id = Wire.Text(value, "hostId", 128);
+            if (!hosts.TryGetValue(id, out host!) || host.Owner.Pid != pid || !Wire.TokenEquals(Wire.Text(value, "lease", 128), host.Lease))
+                throw new CoreFault("unauthorized", "Host ownership is invalid.");
+        }
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
+        timeout.CancelAfter(TimeSpan.FromSeconds(20));
+        try { return await host.Deliveries.Reader.ReadAsync(timeout.Token); }
+        catch (ChannelClosedException) { throw new CoreFault("host_unavailable", "The host is no longer registered."); }
+        catch (OperationCanceledException) when (!cancellation.IsCancellationRequested)
+        {
+            return Wire.Node(new { waiting = true });
+        }
     }
     private JsonNode? Deliver(JsonNode? value)
     {
@@ -397,27 +536,35 @@ public sealed partial class CoreState : IAsyncDisposable
             if (!deliveries.TryGetValue(requestId, out var delivery) || delivery.TargetId != targetId || delivery.RefId != Wire.Text(value, "refId", 32))
                 throw new CoreFault("delivery_not_found", "The delivery is unavailable.");
             var status = Wire.Text(value, "status", 32);
-            if (status is not ("attached" or "unsupported" or "failed")) throw new CoreFault("invalid_params", "Acknowledgement status is invalid.");
+            if (status is not ("attached" or "unsupported" or "failed" or "updating" or "unknown")) throw new CoreFault("invalid_params", "Acknowledgement status is invalid.");
             if (delivery.Status == "attached") return DeliveryNode(delivery);
             delivery.Status = status == "unsupported" ? "queued" : status;
-            delivery.LastError = status == "unsupported" ? "host_context_unsupported" : null;
+            delivery.LastError = status == "unsupported" ? "host_context_unsupported" : status == "unknown" ? "host_context_unknown" : null;
             return DeliveryNode(delivery);
         }
     }
-    public ChannelReader<bool> ConnectApp(string targetId, string token)
+    public sealed record AppConnection(ChannelReader<bool> Reader, string Id);
+    public AppConnection ConnectApp(string targetId, string token)
     {
         lock (sync)
         {
             var chat = Authorize(targetId, token);
             if (chat.Connected) throw new CoreFault("app_already_connected", "This target already has an App connection.");
-            chat.Connected = true; return chat.Signals.Reader;
+            chat.Connected = true; chat.ConnectionId = Guid.NewGuid().ToString("N");
+            MarkActivity(chat); return new AppConnection(chat.Signals.Reader, chat.ConnectionId);
         }
     }
-    public void DisconnectApp(string targetId)
+    public void DisconnectApp(string targetId, string? connectionId = null)
     {
-        // An App disconnect invalidates its route. A still-running MCP proxy does not imply that
-        // this particular chat App can accept context; it must be registered explicitly again.
-        lock (sync) RemoveChat(targetId);
+        // Preserve authorization and pending references for an explicit reconnect. The owning
+        // MCP process (or explicit unregister) bounds the target lifetime. Offline is never a
+        // substitute target and never acknowledged as attached.
+        lock (sync) if (chats.TryGetValue(targetId, out var chat) && (connectionId is null || chat.ConnectionId == connectionId))
+        {
+            chat.Connected = false;
+            foreach (var delivery in deliveries.Values.Where(item => item.TargetId == targetId && item.Status == "updating"))
+            { delivery.Status = "unknown"; delivery.LastError = "host_context_unknown"; }
+        }
         ScheduleIdleShutdown();
     }
     public JsonNode[] PendingEvents(string targetId, string token)

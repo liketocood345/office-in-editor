@@ -3,25 +3,42 @@ using System.Runtime.InteropServices;
 
 namespace OfficeInEditor.OfficeAddin
 {
-    // Microsoft COM interface identifiers; no Office binaries or PIAs are distributed.
-    [ComVisible(true), Guid("B65AD801-ABAF-11D0-BB8B-00A0C90F2744")]
+    // Msaddndr.dll / Extensibility.IDTExtensibility2. Signatures follow the type library:
+    // custom is SAFEARRAY(VARIANT)*, not a managed System.Array interface.
+    // Wrong marshalling here AVs inside Word's CLR before OnConnection runs.
+    [ComImport, ComVisible(true), Guid("B65AD801-ABAF-11D0-BB8B-00A0C90F2744")]
     [InterfaceType(ComInterfaceType.InterfaceIsDual)]
+    [TypeLibType(TypeLibTypeFlags.FDual | TypeLibTypeFlags.FDispatchable)]
     public interface IDTExtensibility2
     {
-        [DispId(1)] void OnConnection([MarshalAs(UnmanagedType.IDispatch)] object application,
-            int connectMode, [MarshalAs(UnmanagedType.IDispatch)] object addInInst, ref Array custom);
-        [DispId(2)] void OnDisconnection(int removeMode, ref Array custom);
-        [DispId(3)] void OnAddInsUpdate(ref Array custom);
-        [DispId(4)] void OnStartupComplete(ref Array custom);
-        [DispId(5)] void OnBeginShutdown(ref Array custom);
+        [DispId(1)]
+        void OnConnection(
+            [In, MarshalAs(UnmanagedType.IDispatch)] object application,
+            [In] int connectMode,
+            [In, MarshalAs(UnmanagedType.IDispatch)] object addInInst,
+            [In, MarshalAs(UnmanagedType.SafeArray, SafeArraySubType = VarEnum.VT_VARIANT)] ref Array custom);
+        [DispId(2)]
+        void OnDisconnection(
+            [In] int removeMode,
+            [In, MarshalAs(UnmanagedType.SafeArray, SafeArraySubType = VarEnum.VT_VARIANT)] ref Array custom);
+        [DispId(3)]
+        void OnAddInsUpdate(
+            [In, MarshalAs(UnmanagedType.SafeArray, SafeArraySubType = VarEnum.VT_VARIANT)] ref Array custom);
+        [DispId(4)]
+        void OnStartupComplete(
+            [In, MarshalAs(UnmanagedType.SafeArray, SafeArraySubType = VarEnum.VT_VARIANT)] ref Array custom);
+        [DispId(5)]
+        void OnBeginShutdown(
+            [In, MarshalAs(UnmanagedType.SafeArray, SafeArraySubType = VarEnum.VT_VARIANT)] ref Array custom);
     }
 
-    [ComVisible(true), Guid("000C0396-0000-0000-C000-000000000046")]
+    [ComImport, ComVisible(true), Guid("000C0396-0000-0000-C000-000000000046")]
     [InterfaceType(ComInterfaceType.InterfaceIsDual)]
+    [TypeLibType(TypeLibTypeFlags.FDual | TypeLibTypeFlags.FDispatchable)]
     public interface IRibbonExtensibility
     {
         [DispId(1)]
         [return: MarshalAs(UnmanagedType.BStr)]
-        string GetCustomUI([MarshalAs(UnmanagedType.BStr)] string ribbonId);
+        string GetCustomUI([In, MarshalAs(UnmanagedType.BStr)] string ribbonId);
     }
 }

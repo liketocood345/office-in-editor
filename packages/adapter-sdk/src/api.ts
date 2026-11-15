@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { OfficeBridgeError } from "./errors";
 import { isRecord } from "./protocol";
+import { OPEN_DOCUMENT_TIMEOUT_MS } from "./protocol";
 import type {
   BrokerTransport, CoreHealth, DashboardSnapshot, DeliveryReceipt, HostLease,
-  HostRegistration, OfficeInstance, OfficeReference, ReferenceMetadata, RegisteredChat,
+  HostBounds, HostRegistration, OfficeInstance, OfficeReference, ReferenceMetadata, RegisteredChat,
 } from "./types";
 
 function arrayResult<T>(value: unknown): T[] {
@@ -13,7 +14,18 @@ function arrayResult<T>(value: unknown): T[] {
 
 /** Typed local-only feature boundary. Reference text is retrieved only on explicit user action. */
 export class OfficeBroker {
+  private host?: HostLease;
   constructor(private readonly transport: BrokerTransport) {}
+
+  bindHost(lease?: HostLease): void {
+    this.host = lease;
+  }
+
+  private withHost(params: Record<string, unknown>): Record<string, unknown> {
+    const host = this.host;
+    if (!host) return params;
+    return { ...params, hostId: host.hostId, hostLease: host.lease, hostEpoch: host.epoch };
+  }
 
   async health(): Promise<CoreHealth> {
     const value = await this.transport.request<unknown>("health");
@@ -65,8 +77,37 @@ export class OfficeBroker {
     return this.transport.request("reference.deliver", { refId, targetId, requestId });
   }
 
-  openInOffice(documentPath: string): Promise<{ opened: true; mode: "external"; application: string }> {
-    return this.transport.request("office.open", { path: documentPath });
+  openInOffice(
+    documentPath: string,
+    mode: "external" | "embedded" = "external",
+    options: { fallback?: boolean; x?: number; y?: number; width?: number; height?: number; sessionId?: string; surfaceToken?: string; timeoutMs?: number } = {},
+  ): Promise<{ opened: true; mode: "external" | "embedded"; application: string; pid?: number; inplace?: boolean; officeId?: string; hwnd?: string }> {
+    const { timeoutMs = OPEN_DOCUMENT_TIMEOUT_MS, ...payload } = options;
+    return this.transport.request("office.open", this.withHost({ path: documentPath, mode, ...payload }), { timeoutMs: Math.max(250, Math.min(timeoutMs, OPEN_DOCUMENT_TIMEOUT_MS)) });
+  }
+
+  saveOfficeWindow(officeId: string): Promise<{ dirty?: boolean; saved?: boolean }> {
+    return this.transport.request("office.save_window", this.withHost({ officeId }));
+  }
+
+  waitHostDelivery(lease: HostLease, timeoutMs = 25_000): Promise<{ waiting?: boolean; text?: string; documentName?: string; kind?: string; requestId?: string; refId?: string }> {
+    return this.transport.request("host.wait_delivery", { hostId: lease.hostId, lease: lease.lease }, { timeoutMs });
+  }
+
+  describeOfficeWindow(officeId: string): Promise<{ hwnd: string; processId: number; attached: boolean }> {
+    return this.transport.request("office.describe_window", this.withHost({ officeId }));
+  }
+
+  attachOfficeWindow(officeId: string, bounds: HostBounds): Promise<{ attached: true; hwnd: string }> {
+    return this.transport.request("office.attach_window", this.withHost({ officeId, ...bounds }));
+  }
+
+  layoutOfficeWindow(officeId: string, bounds: HostBounds): Promise<{ attached: true }> {
+    return this.transport.request("office.layout_window", this.withHost({ officeId, ...bounds }), { ensureBroker: false, timeoutMs: 1_500 });
+  }
+
+  detachOfficeWindow(officeId: string): Promise<{ attached: false }> {
+    return this.transport.request("office.detach_window", this.withHost({ officeId }), { ensureBroker: false, timeoutMs: 1_500 });
   }
 
   async dashboard(): Promise<DashboardSnapshot> {

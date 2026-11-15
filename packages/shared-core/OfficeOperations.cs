@@ -58,6 +58,32 @@ public sealed partial class CoreState
         catch (CoreFault fault) { throw new CoreFault(fault.Code, "The Office adapter rejected the operation. Inspect its state before continuing."); }
         catch (Exception) { throw new CoreFault("office_outcome_unknown", "The Office response did not complete. Do not replay a possible write."); }
     }
+
+    internal async Task<JsonNode?> InvokeOfficeWindowAsync(string method, JsonNode? value, CancellationToken cancellation)
+    {
+        Office office;
+        lock (sync) office = GetOffice(Wire.Text(value, "officeId", 128));
+        var callback = method switch
+        {
+            "office.describe_window" => "describeWindow",
+            "office.attach_window" => "attachWindow",
+            "office.layout_window" => "layoutWindow",
+            "office.detach_window" => "detachWindow",
+            _ => throw new CoreFault("method_not_found", "This window operation is not supported.")
+        };
+        JsonNode? parameters = method switch
+        {
+            "office.describe_window" or "office.detach_window" => null,
+            _ => Wire.Node(new {
+                x = Wire.Number(value, "x"),
+                y = Wire.Number(value, "y"),
+                width = Wire.Number(value, "width"),
+                height = Wire.Number(value, "height"),
+            })
+        };
+        return await CallbackAsync(office, callback, parameters, cancellation)
+            ?? throw new CoreFault("office_window_unavailable", "The Office add-in did not report a document window.");
+    }
     private async Task<JsonNode> InspectForWriteAsync(Office office, string documentId, string? kind, bool reverting, CancellationToken cancellation)
     {
         var inspected = await CallbackAsync(office, "inspectDocument", Wire.Node(new { documentId }), cancellation)
@@ -117,7 +143,7 @@ public sealed partial class CoreState
         }
         try
         {
-            var applied = await CallbackAsync(office, "applyEdit", Wire.Node(new { documentId, operationId, operation, prepared = preparation["prepared"]!.DeepClone(), beforeHash }), cancellation);
+            var applied = await CallbackAsync(office, "applyEdit", Wire.Node(new { documentId, operationId, operation, prepared = preparation["prepared"]!.DeepClone(), recovery = preparation["recovery"]!.DeepClone(), beforeHash }), cancellation);
             var afterHash = Wire.Text(applied, "afterHash", 128);
             lock (sync)
             {
@@ -149,6 +175,9 @@ public sealed partial class CoreState
         try
         {
             var result = await CallbackAsync(office, "saveDocument", Wire.Node(new { documentId, operationId, intent = "manual_save" }), cancellation);
+            if (Wire.Boolean(result, "requiresHostSave"))
+                result = await Task.Run(() => SaveEmbeddedDocument(office, documentId, Wire.Text(result, "sessionId", 64)), cancellation);
+            if (!Wire.Boolean(result, "saved")) throw new CoreFault("save_not_confirmed", "Office did not confirm saving this document.");
             lock (sync)
             {
                 operations.Update(record, next => { next["status"] = "saved"; next["result"] = result?.DeepClone(); });
