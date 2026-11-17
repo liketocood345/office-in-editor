@@ -80,7 +80,7 @@ export class OfficeBroker {
   openInOffice(
     documentPath: string,
     mode: "external" | "embedded" = "external",
-    options: { fallback?: boolean; x?: number; y?: number; width?: number; height?: number; sessionId?: string; surfaceToken?: string; timeoutMs?: number; visible?: boolean; pixelRatio?: number } = {},
+    options: { fallback?: boolean; x?: number; y?: number; width?: number; height?: number; sessionId?: string; surfaceToken?: string; timeoutMs?: number; visible?: boolean; pixelRatio?: number; ackAlerts?: boolean } = {},
   ): Promise<{ opened: true; mode: "external" | "embedded"; application: string; pid?: number; inplace?: boolean; officeId?: string; hwnd?: string; shared?: boolean; viewMode?: string }> {
     const { timeoutMs = OPEN_DOCUMENT_TIMEOUT_MS, ...payload } = options;
     return this.transport.request("office.open", this.withHost({ path: documentPath, mode, ...payload }), { timeoutMs: Math.max(250, Math.min(timeoutMs, OPEN_DOCUMENT_TIMEOUT_MS)) });
@@ -108,6 +108,10 @@ export class OfficeBroker {
 
   detachOfficeWindow(officeId: string): Promise<{ attached: false }> {
     return this.transport.request("office.detach_window", this.withHost({ officeId }), { ensureBroker: true, timeoutMs: 20_000 });
+  }
+
+  configureOfficeWindow(officeId: string, payload: { enabled?: boolean; seconds?: number; saveOnClose?: boolean; ackAlerts?: boolean }): Promise<{ ackAlerts?: boolean; saveOnClose?: boolean }> {
+    return this.transport.request("office.configure_save_window", this.withHost({ officeId, ...payload }));
   }
 
   async dashboard(): Promise<DashboardSnapshot> {

@@ -93,12 +93,30 @@ public sealed partial class CoreState
         var documentId = Wire.Text(value, "documentId", 160);
         var sessionId = Wire.Text(value, "sessionId", 64, false);
         var hostId = "";
-        if (sessionId.Length > 0)
+        var recovered = false;
+        if (sessionId.Length == 0)
+        {
+            var matches = sessionOwners
+                .Where(item => item.Value.ServerPid == pid && OleDocumentHost.IsSessionForProcess(item.Key, pid))
+                .Take(2)
+                .ToArray();
+            if (matches.Length == 1)
+            {
+                sessionId = matches[0].Key;
+                hostId = matches[0].Value.HostId;
+                recovered = true;
+            }
+        }
+        else
         {
             if (!OleDocumentHost.IsSessionForProcess(sessionId, pid) || !sessionOwners.TryGetValue(sessionId, out var session) || session.ServerPid != pid)
                 throw new CoreFault("unauthorized", "The native session does not belong to this Office document process.");
             hostId = session.HostId;
         }
+        // #region agent log
+        DebugNdjson.Probe("F", "CoreRouting.BindDocument", recovered ? "recovered" : sessionId.Length == 0 ? "unbound" : "bound",
+            new { recovered, session = sessionId.Length > 0, host = hostId.Length > 0 });
+        // #endregion
         var key = DocumentKey(office.Id, documentId);
         if (!documentBindings.ContainsKey(key) && documentBindings.Count >= 128)
             throw new CoreFault("quota_exceeded", "The document binding budget is full.");
@@ -203,7 +221,10 @@ public sealed partial class CoreState
             && chats.TryGetValue(route.TargetId, out var routed) && routed.Epoch == route.TargetEpoch
             && (routed.HostId.Length == 0 || binding.HostId.Length == 0 || routed.HostId == binding.HostId))
             return (routed, route.Version);
-        return (chats.Values.OrderByDescending(item => item.ActivitySequence).FirstOrDefault(), 0);
+        IEnumerable<Chat> pool = chats.Values;
+        if (binding.HostId.Length > 0)
+            pool = pool.Where(item => item.HostId == binding.HostId);
+        return (pool.OrderByDescending(item => item.ActivitySequence).FirstOrDefault(), 0);
     }
 
     private async Task<JsonNode?> CaptureAndDeliverAsync(JsonNode? value, int pid, CancellationToken cancellation)
@@ -237,11 +258,14 @@ public sealed partial class CoreState
             Chat? target;
             long version;
             lock (sync) (target, version) = ResolveDeliveryTarget(value, binding);
+            // #region agent log
+            DebugNdjson.Probe("F", "CoreRouting.CaptureAndDeliver", target is null ? "no_target" : "target",
+                new { session = binding.SessionId.Length > 0, bindHost = binding.HostId.Length > 8 ? binding.HostId[..8] : binding.HostId,
+                    targetHost = target is null ? "" : (target.HostId.Length > 8 ? target.HostId[..8] : target.HostId),
+                    sameHost = target is not null && binding.HostId.Length > 0 && target.HostId == binding.HostId });
+            // #endregion
             if (target is null)
             {
-                // #region agent log
-                DebugNdjson.Write("C", "CoreRouting.CaptureAndDeliver", "no_target", new { chats = chats.Count, documentId });
-                // #endregion
                 var skipped = Wire.Node(new { queued = false, reason = "target_unavailable", brokerEpoch });
                 request.Completion.TrySetResult(skipped);
                 return skipped?.DeepClone();
@@ -264,9 +288,6 @@ public sealed partial class CoreState
                     delivered["queued"] = true;
                     delivered["routeVersion"] = version;
                     delivered["brokerEpoch"] = brokerEpoch;
-                    // #region agent log
-                    DebugNdjson.Write("C", "CoreRouting.CaptureAndDeliver", "queued", new { hasTarget = true });
-                    // #endregion
                     result = delivered;
                 }
             }

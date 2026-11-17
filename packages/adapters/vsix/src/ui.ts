@@ -42,22 +42,30 @@ export function hostHtml(
   title: string,
   message: string,
   surfaceToken: string,
-  appearance?: { background: string; foreground: string },
+  appearance?: { background: string; foreground: string; loaderSrc?: string; cspSource?: string },
 ): string {
   void title;
   const nonce = randomBytes(18).toString("base64");
   const token = escapeHtml(surfaceToken);
   const background = escapeHtml(appearance?.background || "#FFFFFF");
   const foreground = escapeHtml(appearance?.foreground || "#201F1E");
+  const loaderSrc = appearance?.loaderSrc ? escapeHtml(appearance.loaderSrc) : "";
+  const imgCsp = appearance?.cspSource ? ` img-src ${appearance.cspSource};` : "";
+  const loaderImg = loaderSrc
+    ? `<img id="status-loader" class="host-loader-gif" width="90" height="90" alt="" src="${loaderSrc}">`
+    : "";
   return `<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}'; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';${imgCsp} base-uri 'none'; form-action 'none'">
 <title>${token}</title>
 <style nonce="${nonce}">
 html,body,#ole-root{margin:0;height:100%;width:100%;min-height:100%;min-width:100%;overflow:hidden;background:${background}!important;color:${foreground}}
 #ole-root{position:absolute;inset:0}
 .host-status{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;padding:24px;text-align:center;color:${foreground};font-family:var(--vscode-font-family)}
+.host-loader{display:flex;flex-direction:column;align-items:center;justify-content:center}
+.host-loader-gif{width:90px;height:90px;object-fit:contain;display:block;flex:none}
+.host-loader-line{margin:16px 0 0;padding:0;font:inherit;color:inherit;line-height:1.4}
 .host-ready{position:absolute;inset:0}
 .oie-beacon{position:absolute;width:1px;height:1px;padding:0;margin:0;border:0;border-radius:0;pointer-events:none;z-index:3;background:${background}}
 .oie-beacon[data-oie-beacon="tl"]{left:0;top:0}
@@ -71,7 +79,7 @@ html,body,#ole-root{margin:0;height:100%;width:100%;min-height:100%;min-width:10
 <div class="oie-beacon" data-oie-beacon="tr" role="img" aria-label="${token}:tr"></div>
 <div class="oie-beacon" data-oie-beacon="bl" role="img" aria-label="${token}:bl"></div>
 <div class="oie-beacon" data-oie-beacon="br" role="img" aria-label="${token}:br"></div>
-<div id="status" class="host-status"${message ? "" : " hidden"}>${escapeHtml(message)}</div>
+<div id="status" class="host-status"${message ? "" : " hidden"}><div class="host-loader">${loaderImg}<p class="host-loader-line"><span id="status-label">${escapeHtml(message)}</span><span id="status-dots">.</span></p></div></div>
 <div id="surface" class="host-ready" hidden></div>
 </div>
 <script nonce="${nonce}">
@@ -82,7 +90,23 @@ document.title=surfaceToken;
 const root=document.getElementById('ole-root');
 const statusNode=document.getElementById('status');
 const surface=document.getElementById('surface');
+const statusLabel=document.getElementById('status-label');
+const statusDots=document.getElementById('status-dots');
+const statusLoader=document.getElementById('status-loader');
 let acknowledged=false;
+let marks=1;
+let ellipsis=0;
+if(typeof setInterval==='function'&&statusDots){
+  ellipsis=setInterval(()=>{
+    if(!statusDots||statusNode.hidden) return;
+    marks=marks%3+1;
+    statusDots.textContent='.'.repeat(marks);
+  },400);
+}
+function stopLoader(){
+  if(ellipsis&&typeof clearInterval==='function') clearInterval(ellipsis);
+  ellipsis=0;
+}
 window.addEventListener('error',()=>api.postMessage({action:'script-error'}));
 api.postMessage({action:'ready'});
 window.addEventListener('message',event=>{
@@ -97,11 +121,16 @@ window.addEventListener('message',event=>{
     statusNode.style.color=data.foreground;
   }
   if(data.kind==='status'&&typeof data.text==='string'){
-    statusNode.textContent=data.text;
+    stopLoader();
+    if(statusLoader) statusLoader.hidden=true;
+    if(statusDots) statusDots.textContent='';
+    if(statusLabel) statusLabel.textContent=data.text;
+    else statusNode.textContent=data.text;
     statusNode.hidden=false;
     surface.hidden=true;
   }
   if(data.kind==='attached'){
+    stopLoader();
     statusNode.hidden=true;
     surface.hidden=false;
   }

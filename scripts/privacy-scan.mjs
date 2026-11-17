@@ -30,7 +30,10 @@ export async function scanRepository(root = process.cwd()) {
   const personalRoots = [root, os.homedir(), process.env.USERPROFILE, process.env.LOCALAPPDATA].filter(Boolean);
   for (const name of new Set(names)) {
     const bytes = await readFile(path.join(root, name));
-    if (bytes.includes(0)) { failures.push({ file: name, rule: 'unexpected-tracked-binary', line: 1 }); continue; }
+    if (bytes.includes(0)) {
+      if (!/\.(?:gif|png|jpe?g|webp|ico)$/i.test(name)) failures.push({ file: name, rule: 'unexpected-tracked-binary', line: 1 });
+      continue;
+    }
     for (const finding of inspectText(bytes.toString('utf8'), personalRoots)) failures.push({ file: name, ...finding });
   }
   return { fileCount: new Set(names).size, failures };

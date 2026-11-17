@@ -85,7 +85,7 @@
 
 1. **表面**：每个自定义编辑器标签种下唯一 `oie-surface-` 令牌，`#ole-root` 铺满 webview。定位只认这个令牌及其四角打点（见下节），不认 `window.screenX/Y`，不认「看起来差不多大的窗」，也不把 IDE 主客户区或 workbench 级 Chromium HWND 当编辑器。
 2. **容器**：Core 为 **这一次打开** 建一个自己的 HWND，实现文档站点接口。只 `SetParent` 这个容器，永不 `SetParent` Office 主框。当前因跨进程 `WS_CHILD` 会附着 Chromium 输入队列，容器以 owned `WS_POPUP` 铺在令牌矩形上；尺寸必须等于 `#ole-root`，不得铺满 IDE。
-3. **文档对象**：按已验证的文档接口创建/绑定。`OleCreateFromFile` 只从 **暂存副本** 创建，禁止直接以写方式打开用户原件。原件回写只走保存按钮那一条 `IPersistFile.Save(原路径)`（见「原件保存」）。rclsid 按规范可传 CLSID_NULL；`GetClassFile` 失败时才用 ProgID 补 CLSID，补不到则短状态失败。容器客户区要再扣除 Office 协商的边界 UI。
+3. **文档对象**：按已验证的文档接口创建/绑定。`OleCreateFromFile` 只从 **暂存副本** 创建，禁止直接以写方式打开用户原件。暂存文件名必须带会话戳（`working-<32hex>.xlsx`），不得所有会话都叫 `working.xlsx`：Excel 同一进程里禁止两个同名工作簿，否则弹「无法同时打开两个同名的工作簿」并 `E_ABORT`。原件回写只走保存按钮那一条 `IPersistFile.Save(原路径)`（见「原件保存」）。rclsid 按规范可传 CLSID_NULL；`GetClassFile` 失败时才用 ProgID 补 CLSID，补不到则短状态失败。容器客户区要再扣除 Office 协商的边界 UI。
 4. **主框**：激活时出现的独立主窗不是嵌套目标。仅在证明窗口属于本 session/document 且不影响用户独立文档后，才允许针对性 Hide。**禁止全桌面新窗口差集 Hide/Close**，禁止隐藏 `#32770` / `NUIDialog` / `bosa_sdm*` 等安全、修复、保存提示；无法证明归属就停止控制。类名最多作诊断。
 5. **加载项**：每款补齐注册、文档身份、Ribbon/context ID、选区、保护状态和保存适配，再按能力开放 MCP。缺模型不改为抓主窗，也不能宣称已有全系列协作能力。
 
@@ -101,10 +101,10 @@ OneNote 现代客户端、仅云笔记本、无 `IOleObject`/`IOleDocument`/`IOl
 
 ### 静默加载、切走标签与输入范围
 
-- **静默加载**：`CreateWindow` 起就是隐藏的。`Place(show=true)`、可见 `ShowWindow` 只允许在 `open_ok` 之后。加载中标签可以显示 Webview 短状态（「正在打开」），那是页内 DOM，不是覆盖整个 IDE 的原生窗。
+- **静默加载**：`CreateWindow` 起就是隐藏的。`Place(show=true)`、可见 `ShowWindow` 只允许在 `open_ok` 之后。加载中标签显示页内 DOM：90×90 GIF 居中叠在「正在加载 Office」之上，文字略下移，句号 `.` / `..` / `...` 循环；不是覆盖整个 IDE 的原生窗。
 - **失败**：Abort/Dispose 本次容器；不得把 32×32 或错误矩形的 popup 留在工作区上。失败不得劫持侧栏、聊天、标签栏的键鼠。
 - **切走**：只 Hide 该会话容器，保留 OLE 原位 UI（功能区边距不清零）。Cursor 自定义编辑器 `retainContextWhenHidden:true`；打开成功后 `keepEditor` + 钉住，避免预览标签被挤掉而 `dispose`→detach。本机 Cursor 无编辑器休眠设置可关。
-- **切回**：用已信任的令牌矩形缓存，或重新打点；禁止用 `window.screenX/Y` 回退。禁止在切回时对整个 IDE 树做无超时 `FindFirst`（会把 STA 卡死数十秒）。
+- **切回**：立刻用已信任的 owner 边距把容器摆回上次矩形，再空闲校准打点。禁止把 webview 刚显示那几帧、更靠近 IDE 原点的半成品打点并集写进位置（会斜向左上漂几帧再弹回）。禁止用 `window.screenX/Y` 回退。禁止在切回时对整个 IDE 树做无超时 `FindFirst`（会把 STA 卡死数十秒）。
 - **溢出即缺陷**：命中矩形相对 IDE 主窗 ≥80% 面积、或明显大于 Webview 上报的编辑区，一律视为未找到表面，保持隐藏。
 
 ## 原件保存与定时保存
@@ -133,6 +133,7 @@ OneNote 现代客户端、仅云笔记本、无 `IOleObject`/`IOleDocument`/`IOl
 关闭：
 
 - Ribbon「关标签保存」与「定时保存」并列，默认开。关最后一个该文件标签时，开则走 `SaveObject`，关则 `OLECLOSE_NOSAVE`。先 Hide/Destroy 容器 HWND，避免标签已关表面仍停在 IDE 上。
+- **自动确认警告**（默认开）：只对 **标签嵌套** 生效。警告弹窗本身仍会出现；当可见按钮恰好一颗且文案是确认（确定/OK/是）时，向该按钮 `PostMessage(BM_CLICK)`。以文案为准：Excel 单按钮「确定」的控件 ID 有时是 `IDCANCEL`，仍要点。不设 `DisplayAlerts=false`、不装全局键鼠钩子。两颗及以上（是/否、确定/取消）不动。独立打开的 Office 窗口不挂钩。Office in Editor 功能区与编辑器标题栏各有同一开关。
 
 计时与排队：
 
@@ -153,7 +154,7 @@ OneNote 现代客户端、仅云笔记本、无 `IOleObject`/`IOleDocument`/`IOl
 - 每个标签一次打开对应 **一条** OLE 会话。会话记住该次原位对象窗口的进程 ID。随后 `office.register` 若 pid 匹配某条嵌入会话，则该实例标为嵌入，接收 MCP 重绑。多种类、多标签可以同时有多条会话；不要用「全局只有一条 HasSession」挡打开。
 - 容器 HWND 先隐藏创建。几何只来自令牌/四角打点的屏幕矩形。禁止 `HWND_TOPMOST`、禁止为对齐去 `SetForegroundWindow`、禁止按其它窗口的宽高做匹配、禁止用 `window.screenX/Y` 把 popup 摆到 IDE 原点或铺满工作区。**第一次**用四角打点解析 IDE owner 与相对边距；之后 `SetWindowPos` 跟 owner 边距走。侧栏等外框不变、编辑区变时，空闲再用 `#ole-root` 的 CSS 尺寸校准（保持左/上边距）。尺寸变了才 `SetRect`。禁止空闲校准再走 UIA 全树 / `uia-token`、禁止 80ms/`PrintWindow` 轮询、禁止每次 layout 改窗口样式或 `UIDeactivate`。
 - 文件名以 `~` 开头的 Office 锁/缓存文件（如 `~$文档.docx`）不得作为文档宿主。资源管理器默认隐藏 `**/~$*`，不把锁文件列成可点条目。误点 `~$文档.docx` 时打开同目录 `文档.docx` 的标签，并立刻关掉缓存标签，不提示「不要打开」。对不上原件时也关掉缓存标签，不留下空页。末视图 OLE `Close` 之后，若原件旁 `~$` 兄弟锁已无人占用，才删除该锁（Word 崩溃残留）；占用中的锁不删。Core 仍拒绝把缓存路径送进 OLE。未 `open_ok` 时窗口保持隐藏；`ShowObject` 也不得在 attach 前把容器亮出来。`GetContainer` 返回自身 `IOleContainer`。按暂存副本 `OleCreateFromFile` 之后 `OleRun`，把 `IOleObject` 赋给站点，**表面已解析且仍隐藏** 时再原位激活，成功后再 Show。Word 会在 `DoVerb` 期间回调 `ActivateMe`，此时必须已经能 `CreateView`。关标签走 `office.detach_window` 只拆除 **该标签** 对应会话。
-- **每种** Office 文档服务器一条 STA。该线程在空闲时泵消息（`MsgWaitForMultipleObjects` + `PeekMessage`），**在 `OleCreateFromFile` / `DoVerb` 等阻塞 COM 调用期间也必须泵**（`IMessageFilter.MessagePending`），否则 Excel/PPT 会在调用方 STA 上卡到标签 60 秒上限。不能只在每次 `Invoke` 返回后 `PeekMessage`。不同种类的 STA 互不阻塞。
+- **每种** Office 文档服务器一条 STA。该线程在空闲时泵消息（`MsgWaitForMultipleObjects` + `PeekMessage`），**在 `OleCreateFromFile` / `DoVerb` 等阻塞 COM 调用期间也必须泵**（`IMessageFilter.MessagePending`），否则 Excel/PPT 会在调用方 STA 上卡到标签 60 秒上限。不能只在每次 `Invoke` 返回后 `PeekMessage`。不同种类的 STA 互不阻塞。Excel 在 `OLERENDER_NONE` 上 `OleCreateFromFile` 常返回 `E_ABORT`：再试 `OLERENDER_DRAW`，然后 `CoCreate` + `IPersistFile.Load`（`STGM_READWRITE|SHARE_DENY_WRITE`，失败再换模式），最后 `BindMoniker`。`CoCreate` 成功后不得用 `Load(..., 0)` 直接放弃。
 - 存在 **任意** 活动 OLE 会话时 Core 不算空闲，不得按 20 秒空闲把容器进程退出。全部会话拆除后才恢复空闲退出。
 
 ## Add to Chat 目标

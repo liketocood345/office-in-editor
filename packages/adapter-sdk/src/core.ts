@@ -38,15 +38,9 @@ export async function readCoreEndpoint(executable: string, ensureBroker = false)
       cwd: path.dirname(executable),
     }, (error, output) => {
       if (error) {
-        // #region agent log
-        fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "H1", location: "core.ts:readCoreEndpoint", message: "core_start_failed", data: { killed: Boolean(error.killed), ensureBroker }, timestamp: Date.now() }) }).catch(() => {});
-        // #endregion
         // Ignore stderr and native error strings; both can contain local paths.
         reject(new OfficeBridgeError(error.killed ? "REQUEST_TIMEOUT" : "CORE_START_FAILED"));
       } else {
-        // #region agent log
-        fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "H1", location: "core.ts:readCoreEndpoint", message: "core_endpoint_ok", data: { ensureBroker, outLen: output.length }, timestamp: Date.now() }) }).catch(() => {});
-        // #endregion
         resolve(output);
       }
     });

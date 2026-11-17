@@ -16,9 +16,6 @@ internal static class NativeOfficeLauncher
         if (!File.Exists(fullPath)) throw new CoreFault("file_not_found", "The selected document is unavailable.");
         if (Path.GetFileName(fullPath).StartsWith('~'))
         {
-            // #region agent log
-            DebugNdjson.Write("C", "NativeOfficeLauncher.Open", "office_cache_file", new { hypothesisId = "C1", runId = "post-fix", nameLen = Path.GetFileName(fullPath).Length });
-            // #endregion
             throw new CoreFault("office_cache_file", "This is an Office cache file and should not be opened.");
         }
         if (!OfficeDocumentKind.TryClassify(fullPath, out var kind))
@@ -26,16 +23,6 @@ internal static class NativeOfficeLauncher
         _ = (x, y);
         if (mode == "embedded")
         {
-            // #region agent log
-            DebugNdjson.Write("A", "NativeOfficeLauncher.cs:embedded", "embedded_open", new
-            {
-                fallback, width, height, startProcess = false,
-                hasToken = WebviewSurface.IsToken(surfaceToken),
-                kindKey = kind.Key, application = kind.Application,
-                clsid = kind.Clsid.ToString("B"), getClassHr = kind.GetClassFileHr,
-                server = kind.ServerFile
-            });
-            // #endregion
             if (!WebviewSurface.IsToken(surfaceToken) || width < 32 || height < 32)
                 throw new CoreFault("invalid_host_window", "A valid editor webview surface is required.");
             try
@@ -44,7 +31,13 @@ internal static class NativeOfficeLauncher
                 if (hosted is not null) return hosted;
             }
             catch (OperationCanceledException) { throw; }
-            catch (CoreFault) { throw; }
+            catch (CoreFault fault)
+            {
+                // #region agent log
+                DebugNdjson.Probe("I", "NativeOfficeLauncher.Open", fault.Code, new { code = fault.Code, kind = kind.Key });
+                // #endregion
+                throw;
+            }
             catch
             {
                 throw new CoreFault("ole_embed_failed", "The document could not be hosted in the editor tab.");
@@ -59,9 +52,6 @@ internal static class NativeOfficeLauncher
         {
             var start = new ProcessStartInfo(executable) { UseShellExecute = false };
             start.ArgumentList.Add(fullPath);
-            // #region agent log
-            DebugNdjson.Write("B", "NativeOfficeLauncher.cs:external", "external_process_start", new { application = kind.Application, startProcess = true });
-            // #endregion
             using var process = Process.Start(start);
             return Wire.Node(new { opened = true, mode, application = kind.Application, pid = process?.Id, inplace = false });
         }

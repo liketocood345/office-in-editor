@@ -37,6 +37,9 @@ internal static class SurfaceGeometryTests
             && WebviewSurface.ApplyOwnerInsets(new(0, 40, 1920, 1080), insetL, insetT, insetR, insetB)
                 == new WebviewSurface.ScreenBounds(120, 160, 1200, 900),
             "owner-inset follow preserves the beacon rectangle when the IDE window moves or resizes");
+        check(WebviewSurface.ShiftedTowardOwnerOrigin(owner, rectangle, new(owner.X + 8, owner.Y + 8, 1200, 900))
+            && !WebviewSurface.ShiftedTowardOwnerOrigin(owner, rectangle, new(rectangle.X, rectangle.Y, 1100, 900)),
+            "a tab-reveal beacon union that walks toward the IDE origin is rejected; a same-origin shrink is not");
         check(WebviewSurface.PhysicalFromCss(1107, 1) == 1107 && WebviewSurface.PhysicalFromCss(800, 1.5) == 1200,
             "CSS idle mapping uses the reported pixel ratio");
         check(WebviewSurface.TryCssIdleNested(new(0, 0, 1935, 1056), 222, 110, 807, 853, 1, out var cssIdle)

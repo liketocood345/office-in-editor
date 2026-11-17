@@ -71,7 +71,10 @@ public static class Program
         Assert(RibbonMarkup.Build("word").Contains("OieTab"));
         Assert(RibbonMarkup.Build("word").Contains("OieSaveOnClose"));
         Assert(RibbonMarkup.Build("word").Contains("关标签保存"));
+        Assert(RibbonMarkup.Build("word").Contains("OieAckAlerts"));
+        Assert(RibbonMarkup.Build("word").Contains("自动确认警告"));
         Assert(RibbonMarkup.Build("excel").Contains("OieSaveOnClose"));
+        Assert(RibbonMarkup.Build("excel").Contains("OieAckAlerts"));
         Assert(!RibbonMarkup.Build("word").Contains("ContextMenuHeading"));
         var addin = new OfficeAddin();
         var fallback = addin.GetCustomUI(null);

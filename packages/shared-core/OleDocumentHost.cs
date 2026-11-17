@@ -19,9 +19,11 @@ internal static class OleDocumentHost
     private const int OleClosePromptSave = 2;
     private const uint RpcECantCalloutInInputSyncCall = 0x8001010D;
     private const int OleRenderNone = 0;
+    private const uint OleRenderDraw = 1;
     private const int StgmCreate = 0x00001000;
     private const int StgmReadWrite = 0x00000002;
     private const int StgmShareExclusive = 0x00000010;
+    private const int StgmShareDenyWrite = 0x00000020;
     private const uint WsPopup = 0x80000000;
     private const uint WsClipChildren = 0x02000000;
     private const uint WsVisible = 0x10000000;
@@ -67,6 +69,10 @@ internal static class OleDocumentHost
     private const uint SwpNoZOrder = 0x0004;
     private const uint SwpShowWindow = 0x0040;
     private const uint SwpHideWindow = 0x0080;
+    private const uint RdwInvalidate = 0x0001;
+    private const uint RdwAllChildren = 0x0080;
+    private const uint RdwUpdatenow = 0x0100;
+    private const int SwShowNoActivate = 8;
     private const uint WmSize = 0x0005;
     private const uint WmPaint = 0x000F;
     private const uint WmErasebkgnd = 0x0014;
@@ -151,15 +157,6 @@ internal static class OleDocumentHost
         sessionHosts[sessionId] = host;
         lock (Gate) { trace.Clear(); traceStart = Stopwatch.GetTimestamp(); }
         Trace("sta_queued");
-        // #region agent log
-        DebugNdjson.Write("B", "OleDocumentHost.TryOpen", "kind_sta", new
-        {
-            kindKey = kind.Key, application = kind.Application, requested = application,
-            sessionPrefix = sessionId.Length > 12 ? sessionId[4..12] : sessionId,
-            openingForKind = host.Opening, sessionsForKind = Volatile.Read(ref host.SessionCount),
-            kindCount = kinds.Count, existing, shareExisting = existing > 0
-        });
-        // #endregion
         try
         {
             return host.Sta.Invoke(() =>
@@ -198,9 +195,6 @@ internal static class OleDocumentHost
         if (method == "office.detach_window" && opening.TryGetValue(requestedId, out var pending))
         {
             try { pending.Cancel(); } catch (ObjectDisposedException) { }
-            // #region agent log
-            DebugNdjson.Write("C", "OleDocumentHost.TryHandleWindow", "detach_cancel_opening", new { hypothesisId = "C", runId = "close-geo", sessionPrefix = requestedId.Length > 12 ? requestedId[4..12] : requestedId });
-            // #endregion
             result = Wire.Node(new { attached = false, cancellationRequested = true });
             if (!sessionHosts.TryGetValue(requestedId, out var openingHost)) return true;
             Session? inFlight;
@@ -257,22 +251,14 @@ internal static class OleDocumentHost
         List<IntPtr>? existingFrames = null;
         HashSet<uint>? protectPids = null;
         var exclusive = false;
-        var t0 = Stopwatch.GetTimestamp();
-        long Ms() => (long)Stopwatch.GetElapsedTime(t0).TotalMilliseconds;
-        long filesMs = 0, placeHiddenMs = 0, createMs = 0, activateMs = 0, placeShowMs = 0;
         try
         {
             site = new OleSite { DocumentPath = path, SourceBound = bindSource, Sta = host.Sta, PixelRatio = pixelRatio,
-                Files = NativeSessionFiles.Create(path, sessionId, backupId), ForceDirty = !string.IsNullOrEmpty(backupId), OwnObject = true, SaveOnClose = true };
-            filesMs = Ms();
-            // #region agent log
-            DebugNdjson.Write("E", "OleDocumentHost.OpenOnSta", "shared_primary", new { kindKey = kind.Key, working = Path.GetFileName(site.Files.WorkingPath) });
-            // #endregion
+                Files = NativeSessionFiles.Create(path, sessionId, backupId), ForceDirty = !string.IsNullOrEmpty(backupId), OwnObject = true, SaveOnClose = true, AckAlerts = OfficeDialogAck.Enabled };
             site.CreateWindow();
             Trace("container_created");
             step = "place";
             site.Place(surfaceToken, false, width, height, visible ? 6000 : 400, jsX, jsY);
-            placeHiddenMs = Ms();
             NativeWindow.PumpWait(30);
             EnterOleExclusive(cancellation, kind.Key);
             exclusive = true;
@@ -281,30 +267,14 @@ internal static class OleDocumentHost
             step = "storage";
             Guid iid = typeof(IOleObject).GUID;
             object unknown;
-            var sourceLength = new FileInfo(path).Length;
-            // #region agent log
-            DebugNdjson.Write("K", "OleDocumentHost.OpenOnSta", "bind_choice", new
-            {
-                bindSource, via = bindSource ? "BindMoniker" : "OleCreateFromFile",
-                existingFrames = existingFrames.Count, kindKey = kind.Key,
-                clsid = kind.Clsid.ToString("B"), getClassHr = kind.GetClassFileHr
-            });
-            // #endregion
             if (bindSource)
             {
                 step = "bind_source";
                 Trace("bind_source_started");
-                // #region agent log
-                DebugNdjson.Write("K", "OleDocumentHost.OpenOnSta", "bind_enter", new { via = "BindMoniker" });
-                // #endregion
                 Marshal.ThrowExceptionForHR(CreateFileMoniker(path, out var moniker));
                 try { Marshal.ThrowExceptionForHR(BindMoniker(moniker, 0, ref iid, out unknown)); }
                 finally { Marshal.Release(moniker); }
-                createMs = Ms();
                 Trace("bind_source_completed");
-                // #region agent log
-                DebugNdjson.Write("K", "OleDocumentHost.OpenOnSta", "bind_done", new { via = "BindMoniker" });
-                // #endregion
             }
             else
             {
@@ -318,18 +288,14 @@ internal static class OleDocumentHost
                 Trace("ole_create_started");
                 var embedPath = site.Files.WorkingPath;
                 NativeWindow.PumpWait(30);
-                // #region agent log
-                DebugNdjson.Write("D", "OleDocumentHost.OpenOnSta", "bind_enter", new { via = "OleCreateFromFile", clsid = clsid.ToString("B"), kindKey = kind.Key, sourceLength, embedLength = new FileInfo(embedPath).Length, staged = true, exclusiveKind = kind.Key });
-                // #endregion
-                unknown = CreateOleFromFile(site, storage, kind, embedPath, ref iid);
-                createMs = Ms();
+                using (OfficeDialogAck.Scope(kind.ServerFile, site.AckAlerts))
+                    unknown = CreateOleFromFile(site, storage, kind, embedPath, ref iid);
                 cancellation.ThrowIfCancellationRequested();
-                var sourceAfterCreate = new FileInfo(path).Length;
                 Trace("ole_create_completed");
-                // #region agent log
-                DebugNdjson.Write("S", "OleDocumentHost.OpenOnSta", "bind_done", new { via = "OleCreateFromFile", kindKey = kind.Key, sourceLength, sourceAfterCreate, sourceChanged = sourceAfterCreate != sourceLength });
-                // #endregion
                 SweepNewFrames(existingFrames ?? [], site.Handle, protectPids ?? []);
+                // #region agent log
+                DebugNdjson.Probe("E", "OleDocumentHost.OpenOnSta", "create_swept", new { kind = kind.Key });
+                // #endregion
             }
             step = "cast";
             var oleObject = (IOleObject)unknown;
@@ -343,19 +309,8 @@ internal static class OleDocumentHost
             {
                 var source = oleObject as IPersistFile ?? unknown as IPersistFile;
                 string? original = null;
-                var getCur = source is null ? "no_persist" : "ok";
-                try { if (source is not null) source.GetCurFile(out original); }
-                catch (Exception error)
-                {
-                    getCur = error.GetType().Name;
-                    // #region agent log
-                    DebugNdjson.Write("H", "OleDocumentHost.OpenOnSta", "getcurfile_threw", new { type = error.GetType().Name, hr = error.HResult });
-                    // #endregion
-                }
+                try { source?.GetCurFile(out original); } catch { }
                 var match = SameLocalFile(original, path);
-                // #region agent log
-                DebugNdjson.Write("H", "OleDocumentHost.OpenOnSta", "bind_identity", new { persist = source is not null, getCur, curEmpty = string.IsNullOrEmpty(original), match });
-                // #endregion
                 if (source is not null && match)
                 {
                     site.SourceIdentityVerified = true;
@@ -382,16 +337,8 @@ internal static class OleDocumentHost
                     persist.Save(path, true);
                     persist.SaveCompleted(path);
                     site.RefreshSourceStamp();
-                    // #region agent log
-                    DebugNdjson.Write("B", "OleDocumentHost.OpenOnSta", "persist_bound", new { saved = true });
-                    // #endregion
                 }
-                catch (Exception error)
-                {
-                    // #region agent log
-                    DebugNdjson.Write("B", "OleDocumentHost.OpenOnSta", "persist_bind_fail", new { type = error.GetType().Name, hr = error.HResult });
-                    // #endregion
-                }
+                catch { /* Some servers reject an extra persist snapshot after bind. */ }
             }
             Trace("set_host_names_started");
             // Word requires host names even for a file-bound DocObject; without
@@ -419,20 +366,11 @@ internal static class OleDocumentHost
             try { site.ActivateInPlace(); }
             finally { SweepNewFrames(existingFrames ?? [], site.Handle, protectPids ?? []); }
             Trace("activation_completed");
-            activateMs = Ms();
             session.Activated = true;
             GetWindowThreadProcessId(site.ViewHandle == IntPtr.Zero ? site.Handle : site.ViewHandle, out var documentPid);
             session.ServerPid = (int)documentPid;
-            site.ResolveNativeObjectModel(kind.Application);
-            if (site.NativeObjectModelHandle != IntPtr.Zero)
-            {
-                GetWindowThreadProcessId(site.NativeObjectModelHandle, out documentPid);
-                session.ServerPid = (int)documentPid;
-            }
+            OfficeDialogAck.Watch((uint)session.ServerPid, site.AckAlerts);
             lock (Gate) lastFailure = "";
-            // #region agent log
-            DebugNdjson.Write("A", "OleDocumentHost.OpenOnSta", "open_ok", new { kindKey = kind.Key, application = kind.Application, pid = session.ServerPid, inplace = true });
-            // #endregion
             if (cancellation.IsCancellationRequested)
             {
                 site.Place(surfaceToken, false, width, height);
@@ -440,16 +378,23 @@ internal static class OleDocumentHost
                 throw new OperationCanceledException(cancellation);
             }
             if (visible) site.Place(surfaceToken, true, width, height, 6000, jsX, jsY);
-            placeShowMs = Ms();
-            site.ConfigurePeriodicSave(true, 60);
-            // #region agent log
-            DebugNdjson.Write("T", "OleDocumentHost.OpenOnSta", "open_timing", new
+            site.ResolveNativeObjectModel(kind.Application);
+            if (site.NativeObjectModelHandle == IntPtr.Zero)
             {
-                hypothesisId = "T1", runId = "post-fix", kindKey = kind.Key,
-                filesMs, placeHiddenMs, createMs, activateMs, placeShowMs, totalMs = Ms(), visible
-            });
-            DebugNdjson.Write("A", "OleDocumentHost.OpenOnSta", "open_reveal", new { visible, shown = site.Visible, kindKey = kind.Key, periodicSave = site.PeriodicSave, interval = site.SaveIntervalSeconds, saveOnClose = site.SaveOnClose });
+                NativeWindow.PumpWait(40);
+                site.ResolveNativeObjectModel(kind.Application);
+            }
+            if (site.NativeObjectModelHandle != IntPtr.Zero)
+            {
+                GetWindowThreadProcessId(site.NativeObjectModelHandle, out documentPid);
+                session.ServerPid = (int)documentPid;
+                OfficeDialogAck.Watch((uint)session.ServerPid, site.AckAlerts);
+            }
+            // #region agent log
+            DebugNdjson.Probe("G", "OleDocumentHost.OpenOnSta", site.NativeObjectModelHandle == IntPtr.Zero ? "om_missing" : "om_ready",
+                new { kind = kind.Key, om = site.NativeObjectModelHandle != IntPtr.Zero });
             // #endregion
+            site.ConfigurePeriodicSave(true, 60);
             if (cancellation.IsCancellationRequested)
             {
                 CloseOnSta(session, host, discard: true);
@@ -471,9 +416,12 @@ internal static class OleDocumentHost
         catch (Exception error)
         {
             RecordFailure(step, error);
-            // #region agent log
-            DebugNdjson.Write("F", "OleDocumentHost.OpenOnSta", "open_failed", new { step, lastFailure = LastFailure, type = error.GetType().Name, hr = error.HResult, kindKey = kind.Key });
-            // #endregion
+            try
+            {
+                if (site is not null)
+                    ProbeOfficeLock(path, site.Files.WorkingPath, "open_failed", releaseIfFree: true);
+            }
+            catch { }
             bool retained;
             lock (host.Gate) retained = host.Sessions.TryGetValue(sessionId, out var owned) && ReferenceEquals(owned.Site, site);
             if (retained)
@@ -523,12 +471,9 @@ internal static class OleDocumentHost
             Files = shared.Files!, Shared = shared, OwnObject = false, Object = shared.Object, Storage = shared.Storage,
             SaveOnClose = shared.SaveOnClose
         };
-        var t0 = Stopwatch.GetTimestamp();
-        long Ms() => (long)Stopwatch.GetElapsedTime(t0).TotalMilliseconds;
         target.ShellCopy = true;
         target.CreateWindow();
         target.Place(surfaceToken, false, width, height, 400, jsX, jsY);
-        var placeHiddenMs = Ms();
         shared.AddCopy(target);
         shared.Views++;
         var session = new Session
@@ -544,21 +489,9 @@ internal static class OleDocumentHost
         }
         sessionHosts[sessionId] = host;
         if (visible) target.Place(surfaceToken, true, width, height, 6000, jsX, jsY);
-        var placeShowMs = Ms();
         try { shared.Primary?.RestoreUiActivation(); } catch { /* Primary inplace must survive the copy HWND. */ }
         if (target.Handle != IntPtr.Zero) InvalidateRect(target.Handle, IntPtr.Zero, false);
         const string mode = "shell_copy";
-        // #region agent log
-        DebugNdjson.Write("A", "OleDocumentHost.AttachViewOnSta", "share_ok", new
-        {
-            hypothesisId = "H1", runId = "post-fix", kindKey = kind.Key, application = kind.Application, mode,
-            skippedSecondView = true, views = shared.Views, copies = shared.Copies.Count,
-            sessionPrefix = sessionId.Length > 12 ? sessionId[4..12] : sessionId,
-            primaryPrefix = primary.Id.Length > 12 ? primary.Id[4..12] : primary.Id, visible,
-            primaryShellCopy = primary.Site.ShellCopy, primaryOwnObject = primary.Site.OwnObject,
-            placeHiddenMs, placeShowMs, totalMs = Ms()
-        });
-        // #endregion
         return Wire.Node(new
         {
             opened = true, mode = "embedded", application = kind.Application, kind = kind.Key,
@@ -627,23 +560,16 @@ internal static class OleDocumentHost
     private static void EnterOleExclusive(CancellationToken cancellation, string kindKey)
     {
         var gate = OleLock(kindKey);
-        var started = Stopwatch.GetTimestamp();
         while (!Monitor.TryEnter(gate, 40))
         {
             cancellation.ThrowIfCancellationRequested();
             NativeWindow.PumpWait(40);
         }
-        // #region agent log
-        DebugNdjson.Write("L", "OleDocumentHost.OpenOnSta", "ole_exclusive_enter", new { kindKey, lockScope = "kind", waitMs = (long)Stopwatch.GetElapsedTime(started).TotalMilliseconds });
-        // #endregion
     }
 
     private static void ExitOleExclusive(string kindKey)
     {
         if (OleExclusiveByKind.TryGetValue(kindKey, out var gate) && Monitor.IsEntered(gate)) Monitor.Exit(gate);
-        // #region agent log
-        DebugNdjson.Write("L", "OleDocumentHost.OpenOnSta", "ole_exclusive_exit", new { kindKey, lockScope = "kind" });
-        // #endregion
     }
 
     private static int CountSource(string sourceKey) =>
@@ -675,6 +601,13 @@ internal static class OleDocumentHost
             {
                 session.Site.SaveOnClose = Wire.Boolean(value, "saveOnClose");
                 if (session.Site.Shared is not null) session.Site.Shared.SaveOnClose = session.Site.SaveOnClose;
+            }
+            if (value?["ackAlerts"] is not null)
+            {
+                session.Site.AckAlerts = Wire.Boolean(value, "ackAlerts");
+                OfficeDialogAck.Enabled = session.Site.AckAlerts;
+                if (session.Site.AckAlerts) OfficeDialogAck.Watch((uint)session.ServerPid, true);
+                else OfficeDialogAck.Unwatch((uint)session.ServerPid);
             }
             return session.Site.Status();
         }
@@ -727,9 +660,6 @@ internal static class OleDocumentHost
             {
                 if (show && !session.Activated)
                 {
-                    // #region agent log
-                    DebugNdjson.Write("C", "OleDocumentHost.HandleWindowOnSta", "skip_inplace", new { hypothesisId = "H3", runId = "post-fix", show });
-                    // #endregion
                 }
                 session.Activated = true;
             }
@@ -794,15 +724,6 @@ internal static class OleDocumentHost
         var existingFrames = SnapshotVisibleTopLevel();
         var protectPids = ProtectedPids(site.Handle);
         var hostHwnd = site.Handle;
-        // #region agent log
-        DebugNdjson.Write("C", "OleDocumentHost.CloseOnSta", "close_begin", new
-        {
-            lastView, remaining, alias = session.SharedAlias, ownObject = site.OwnObject,
-            saveOnClose = site.Shared?.SaveOnClose ?? site.SaveOnClose, discard, dirty = site.IsDirty,
-            sessionPrefix = session.Id.Length > 12 ? session.Id[4..12] : session.Id,
-            hwnd = hostHwnd.ToInt64()
-        });
-        // #endregion
         if (!lastView)
         {
             lock (host.Gate)
@@ -823,9 +744,6 @@ internal static class OleDocumentHost
         var saveOnClose = owner.Shared?.SaveOnClose ?? owner.SaveOnClose;
         var sourcePath = session.Path;
         var workingPath = owner.Files.WorkingPath;
-        // #region agent log
-        ProbeOfficeLock(sourcePath, workingPath, "close_begin", releaseIfFree: false);
-        // #endregion
         if (saveOnClose && !discard)
         {
             try { owner.SaveObject(); }
@@ -840,9 +758,6 @@ internal static class OleDocumentHost
             var closed = owner.Object?.Close(OleCloseNosave) ?? SOk;
             var sourceAfterClose = 0L;
             try { sourceAfterClose = new FileInfo(session.Path).Length; } catch { }
-            // #region agent log
-            DebugNdjson.Write("S", "OleDocumentHost.CloseOnSta", "close_done", new { closed, sourceBeforeClose, sourceAfterClose, sourceChanged = sourceAfterClose != sourceBeforeClose, lastView });
-            // #endregion
         }
         catch
         {
@@ -857,15 +772,13 @@ internal static class OleDocumentHost
         }
         sessionHosts.TryRemove(session.Id, out _);
         ReleaseSource(Path.GetFullPath(session.Path), session.Id);
+        OfficeDialogAck.Unwatch((uint)session.ServerPid);
         try { owner.Files.DisposeClean(); } catch { }
         owner.OwnObject = true;
         owner.Dispose();
         var hwndAlive = NativeWindow.IsWindow(hostHwnd);
         try { SweepNewFrames(existingFrames, IntPtr.Zero, protectPids); } catch { }
         ProbeOfficeLock(sourcePath, workingPath, "after_close", releaseIfFree: true);
-        // #region agent log
-        DebugNdjson.Write("C", "OleDocumentHost.CloseOnSta", "destroy_hwnd", new { hypothesisId = "C", runId = "close-geo", hwndAlive, lastView });
-        // #endregion
     }
 
     private static string? OfficeLockSibling(string documentPath)
@@ -915,20 +828,6 @@ internal static class OleDocumentHost
     {
         var source = ReleaseOfficeLockIfFree(OfficeLockSibling(sourcePath), releaseIfFree);
         var working = ReleaseOfficeLockIfFree(OfficeLockSibling(workingPath), releaseIfFree);
-        // #region agent log
-        DebugNdjson.Write("L1", "OleDocumentHost.ProbeOfficeLock", "office_lock", new
-        {
-            hypothesisId = "L1",
-            runId = "lock-leftover",
-            phase,
-            sourceExists = source.Exists,
-            sourceHeld = source.Held,
-            sourceDeleted = source.Deleted,
-            workingExists = working.Exists,
-            workingHeld = working.Held,
-            workingDeleted = working.Deleted
-        });
-        // #endregion
     }
 
     private static string StagingCopy(string path)
@@ -972,31 +871,86 @@ internal static class OleDocumentHost
     private static object CreateOleFromFile(OleSite site, IStorage storage, OfficeDocumentKind kind, string embedPath, ref Guid iid)
     {
         var empty = Guid.Empty;
+        var servers = ServerProcessCount(kind.ServerFile);
+        OfficeDialogAck.Pulse("create");
         var hr = OleCreateFromFile(ref empty, embedPath, ref iid, OleRenderNone, IntPtr.Zero, site, storage, out var unknown);
-        // #region agent log
-        DebugNdjson.Write("P", "OleDocumentHost.CreateOleFromFile", "create", new { hr, via = "clsid_null", kindKey = kind.Key, clsid = kind.Clsid.ToString("B") });
-        // #endregion
-        if (hr == SOk) return unknown;
+        if (hr == SOk) return EnsureHostable(unknown, kind);
         var clsid = kind.Clsid;
         if (clsid != Guid.Empty)
         {
+            OfficeDialogAck.Pulse("retry_clsid");
             hr = OleCreateFromFile(ref clsid, embedPath, ref iid, OleRenderNone, IntPtr.Zero, site, storage, out unknown);
-            // #region agent log
-            DebugNdjson.Write("P", "OleDocumentHost.CreateOleFromFile", "create_retry", new { hr, via = "kind_clsid", kindKey = kind.Key });
-            // #endregion
-            if (hr == SOk) return unknown;
+            if (hr == SOk) return EnsureHostable(unknown, kind);
+            NativeWindow.PumpWait(30);
+            OfficeDialogAck.Pulse("retry_draw");
+            hr = OleCreateFromFile(ref clsid, embedPath, ref iid, OleRenderDraw, IntPtr.Zero, site, storage, out unknown);
+            if (hr == SOk) return EnsureHostable(unknown, kind);
+            if (CreateFileMoniker(embedPath, out var moniker) == SOk)
+            {
+                try
+                {
+                    NativeWindow.PumpWait(30);
+                    OfficeDialogAck.Pulse("bind");
+                    var bindHr = BindMoniker(moniker, 0, ref iid, out unknown);
+                    if (bindHr == SOk) return EnsureHostable(unknown, kind);
+                    hr = bindHr;
+                }
+                finally { Marshal.Release(moniker); }
+            }
+            OfficeDialogAck.Pulse("cocreate");
             hr = CoCreateInstance(ref clsid, IntPtr.Zero, 4, ref iid, out unknown);
-            // #region agent log
-            DebugNdjson.Write("P", "OleDocumentHost.CreateOleFromFile", "cocreate", new { hr, kindKey = kind.Key });
-            // #endregion
             if (hr == SOk)
             {
-                if (unknown is IPersistFile persist) persist.Load(embedPath, 0);
-                return unknown;
+                var loadHr = LoadPersistFile(unknown, embedPath);
+                if (loadHr == SOk) return EnsureHostable(unknown, kind);
+                hr = loadHr;
             }
         }
         Marshal.ThrowExceptionForHR(hr);
         return unknown;
+    }
+
+    private static object EnsureHostable(object unknown, OfficeDocumentKind kind)
+    {
+        var isDoc = unknown is IOleDocument;
+        var isInplace = unknown is IOleInPlaceObject;
+        if (isDoc || isInplace) return unknown;
+        if (!string.Equals(kind.Application, "onenote", StringComparison.OrdinalIgnoreCase))
+            return unknown;
+        try { Marshal.ReleaseComObject(unknown); } catch { }
+        throw new CoreFault("ole_embed_failed", "This Office file cannot be hosted in the editor tab.");
+    }
+
+    private static int LoadPersistFile(object unknown, string path)
+    {
+        if (unknown is not IPersistFile persist) return ENointerface;
+        var modes = new[] { StgmReadWrite | StgmShareDenyWrite, StgmReadWrite | StgmShareExclusive, 0 };
+        var last = ENointerface;
+        foreach (var mode in modes)
+        {
+            NativeWindow.PumpWait(10);
+            OfficeDialogAck.Pulse("load:" + mode);
+            try
+            {
+                persist.Load(path, mode);
+                return SOk;
+            }
+            catch (Exception error)
+            {
+                last = error.HResult != 0 ? error.HResult : unchecked((int)0x80004005);
+            }
+        }
+        return last;
+    }
+
+    private static int ServerProcessCount(string serverFile)
+    {
+        try
+        {
+            var name = Path.GetFileNameWithoutExtension(serverFile);
+            return name.Length == 0 ? -1 : Process.GetProcessesByName(name).Length;
+        }
+        catch { return -1; }
     }
 
     private sealed class SharedDocument
@@ -1144,6 +1098,7 @@ internal static class OleDocumentHost
         private int copyPaintLogs;
         internal SharedDocument? Shared;
         internal bool SaveOnClose = true;
+        internal bool AckAlerts = true;
         internal bool SourceBound;
         internal bool SourceIdentityVerified;
         internal NativeSessionFiles Files = null!;
@@ -1158,7 +1113,6 @@ internal static class OleDocumentHost
         private string lastSaveError = "";
         private int saveQueued;
         private bool saving;
-        private int queryStatusCalls;
         private long sourceLength, sourceLastWrite;
         internal void RefreshSourceStamp()
         {
@@ -1206,9 +1160,6 @@ internal static class OleDocumentHost
                 lpszClassName = className
             };
             if (NativeWindow.RegisterClassEx(ref windowClass) == 0) throw new InvalidOperationException();
-            // #region agent log
-            DebugNdjson.Write("G1", "OleSite.CreateWindow", "host_brush", new { hypothesisId = "G1", white = true, shellCopy = ShellCopy });
-            // #endregion
             var ex = WsExToolwindow | (ShellCopy ? WsExNoActivate : 0u);
             Handle = NativeWindow.CreateWindowEx(ex, className, "",
                 WsPopup | WsClipChildren, 0, 0, 32, 32, IntPtr.Zero, IntPtr.Zero, windowClass.hInstance, IntPtr.Zero);
@@ -1225,7 +1176,7 @@ internal static class OleDocumentHost
         }
         internal JsonNode Status(bool saved = false) => Wire.Node(new { dirty = IsDirty, saved,
             periodicSave = PeriodicSave, saveIntervalSeconds = SaveIntervalSeconds, saveError = lastSaveError,
-            saveOnClose = Shared?.SaveOnClose ?? SaveOnClose })!;
+            saveOnClose = Shared?.SaveOnClose ?? SaveOnClose, ackAlerts = AckAlerts })!;
         internal void ConfigurePeriodicSave(bool enabled, int seconds)
         {
             if (seconds is < 5 or > 3600) throw new CoreFault("invalid_save_interval", "Choose an interval between 5 and 3600 seconds.");
@@ -1239,9 +1190,6 @@ internal static class OleDocumentHost
                     try
                     {
                         var dirty = !disposed && PeriodicSave && IsDirty;
-                        // #region agent log
-                        DebugNdjson.Write("A", "OleSite.PeriodicSave", "tick", new { dirty, enabled = PeriodicSave });
-                        // #endregion
                         if (dirty && SaveObject() < 0) PausePeriodicSave();
                     }
                     finally { Interlocked.Exchange(ref saveQueued, 0); }
@@ -1334,22 +1282,25 @@ internal static class OleDocumentHost
         internal void Place(string token, bool show, int width = 0, int height = 0, int resolveMs = 6000, int jsX = 0, int jsY = 0)
         {
             using var physicalCoordinates = WebviewSurface.EnterPhysicalCoordinates();
-            var started = Stopwatch.GetTimestamp();
-            // #region agent log
-            DebugNdjson.Write("H", "OleSite.Place", "place_start", new { tokenLen = token.Length, show, width, height, cached = nestedOwner != IntPtr.Zero, resolveMs });
-            // #endregion
             if (!show)
             {
                 keepInPlaceWhileHidden = true;
                 Visible = false;
                 PauseBeaconCalibrate();
-                // Hiding a tab must not resize the document to CSS dimensions or
-                // move it to the desktop origin. Preserve the calibrated anchor.
+                if (width >= 32 && height >= 32 && Object is null)
+                {
+                    pendingCssW = width;
+                    pendingCssH = height;
+                    var physW = WebviewSurface.PhysicalFromCss(width, PixelRatio);
+                    var physH = WebviewSurface.PhysicalFromCss(height, PixelRatio);
+                    NativeWindow.GetWindowRect(Handle, out var hidden);
+                    NativeWindow.SetWindowPos(Handle, IntPtr.Zero, hidden.Left, hidden.Top, physW, physH,
+                        SwpNoActivate | SwpNoZOrder | SwpHideWindow);
+                }
+                // Hiding a tab that already has OLE must not resize to CSS or
+                // move to the desktop origin. Preserve the calibrated anchor.
                 ShowWindow(Handle, SwHide);
                 UpdateOwnerTracking();
-                // #region agent log
-                DebugNdjson.Write("I", "OleSite.Place", "hidden_keep_ole", new { elapsedMs = (long)Stopwatch.GetElapsedTime(started).TotalMilliseconds, keepUi = true, borderT, borderB });
-                // #endregion
                 return;
             }
             placing = true;
@@ -1373,7 +1324,6 @@ internal static class OleDocumentHost
                 WebviewSurface.Placement surface;
                 var follow = haveInsets && nestedOwner != IntPtr.Zero && NativeWindow.IsWindow(nestedOwner)
                     && WebviewSurface.IsTrustedHow(nestedHow);
-                var usedCache = follow;
                 var prevW = nestedW;
                 var prevH = nestedH;
                 if (follow)
@@ -1381,28 +1331,27 @@ internal static class OleDocumentHost
                     NativeWindow.GetWindowRect(nestedOwner, out var ownerNow);
                     var ownerResized = ownerNow.Right - ownerNow.Left != lastOwnerW || ownerNow.Bottom - ownerNow.Top != lastOwnerH
                         || NativeWindow.GetDpiForWindow(nestedOwner) != ownerDpi;
-                    if (ownerResized || CssDiffersFromNested() || becomingVisible || surfaceNeedsCalibration)
+                    var followed = WebviewSurface.ApplyOwnerInsets(WebviewSurface.Bounds(ownerNow), insetL, insetT, insetR, insetB);
+                    nestedX = followed.X; nestedY = followed.Y;
+                    nestedW = followed.Width; nestedH = followed.Height;
+                    RememberOwner(ownerNow);
+                    surface = new WebviewSurface.Placement(nestedOwner, nestedX, nestedY, nestedW, nestedH, nestedHow);
+                    // Revealing a hidden tab must not consume a half-laid-out beacon
+                    // union: it sits closer to the owner origin for a few frames.
+                    if (!becomingVisible && (ownerResized || CssDiffersFromNested() || surfaceNeedsCalibration))
                     {
                         var refreshed = WebviewSurface.TryRefresh(token, pendingCssW, pendingCssH, PixelRatio);
-                        if (refreshed is null || refreshed.Value.Parent != nestedOwner)
+                        if (refreshed is not null && refreshed.Value.Parent == nestedOwner
+                            && !WebviewSurface.ShiftedTowardOwnerOrigin(WebviewSurface.Bounds(ownerNow),
+                                followed, new(refreshed.Value.X, refreshed.Value.Y, refreshed.Value.Width, refreshed.Value.Height)))
+                        {
+                            AcceptBeacon(refreshed.Value);
+                            surface = refreshed.Value;
+                        }
+                        else
                         {
                             surfaceNeedsCalibration = true;
-                            ownerTracker?.InvalidateAnchor();
-                            Visible = true;
-                            ShowWindow(Handle, SwHide);
-                            ScheduleBeaconCalibrate();
-                            return;
                         }
-                        AcceptBeacon(refreshed.Value);
-                        surface = refreshed.Value;
-                    }
-                    else
-                    {
-                        var followed = WebviewSurface.ApplyOwnerInsets(WebviewSurface.Bounds(ownerNow), insetL, insetT, insetR, insetB);
-                        nestedX = followed.X; nestedY = followed.Y;
-                        nestedW = followed.Width; nestedH = followed.Height;
-                        RememberOwner(ownerNow);
-                        surface = new WebviewSurface.Placement(nestedOwner, nestedX, nestedY, nestedW, nestedH, nestedHow + "-follow");
                     }
                 }
                 else
@@ -1411,11 +1360,12 @@ internal static class OleDocumentHost
                     if (resolved is null || !WebviewSurface.IsTrustedHow(resolved.Value.How)
                         || !WebviewSurface.FitsEditor(resolved.Value, width, height, PixelRatio))
                     {
-                        // #region agent log
-                        DebugNdjson.Write("G", "OleSite.Place", "surface_miss", new { tokenLen = token.Length, show, resolveMs, jsX, jsY, jsIgnored = true, how = resolved?.How, resolvedW = resolved?.Width, resolvedH = resolved?.Height, expectW = width, expectH = height });
-                        // #endregion
                         Visible = false;
                         ShowWindow(Handle, SwHide);
+                        // #region agent log
+                        DebugNdjson.Probe("I", "OleSite.Place", "resolve_failed",
+                            new { show, becomingVisible, hasObject = Object is not null, resolveMs });
+                        // #endregion
                         if (Object is null)
                             throw new CoreFault("invalid_host_window", "The editor tab surface is unavailable.");
                         return;
@@ -1432,9 +1382,9 @@ internal static class OleDocumentHost
                     && (before.Bottom - before.Top) == surface.Height;
                 var sizeChanged = nestedW != prevW || nestedH != prevH;
                 var cssDiff = CssDiffersFromNested();
-                Visible = true;
-                if (!same && !NativeWindow.SetWindowPos(Handle, IntPtr.Zero, surface.X, surface.Y, surface.Width, surface.Height,
-                    SwpNoActivate | SwpShowWindow | SwpNoZOrder))
+                if (!becomingVisible) Visible = true;
+                var posFlags = SwpNoActivate | SwpNoZOrder | (becomingVisible ? SwpHideWindow : SwpShowWindow);
+                if (!same && !NativeWindow.SetWindowPos(Handle, IntPtr.Zero, surface.X, surface.Y, surface.Width, surface.Height, posFlags))
                     throw new InvalidOperationException("Office layout failed.");
                 if (follow)
                 {
@@ -1442,38 +1392,15 @@ internal static class OleDocumentHost
                     // Explicit webview layout can move a pane without changing
                     // its size. Coalesce one cached-node refresh for that case too.
                     ScheduleBeaconCalibrate();
-                    // #region agent log
-                    if (!same || cssDiff)
-                        DebugNdjson.Write("L", "OleSite.Place", "follow_owner", new { hypothesisId = "G3", runId = "post-fix2", becomingVisible, sizeChanged, cssDiff, source = "insets", cssW = width, cssH = height, w = nestedW, h = nestedH, insetL, insetT, insetR, insetB, pixelRatio = PixelRatio, skippedPos = same, elapsedMs = (long)Stopwatch.GetElapsedTime(started).TotalMilliseconds });
-                    // #endregion
-                    if (becomingVisible) RestoreUiActivation();
-                    UpdateOwnerTracking();
+                    if (becomingVisible) RevealAfterLayout();
+                    else UpdateOwnerTracking();
                     if (sizeChanged) Shared?.InvalidateCopies();
                     return;
                 }
-                NativeWindow.GetWindowRect(nestedOwner, out var ownerBox);
-                NativeWindow.GetWindowRect(Handle, out var placed);
-                var host = NativeWindow.DescribeHost(Handle, surface.Parent);
-                // #region agent log
-                DebugNdjson.Write("G", "OleSite.Place", "nested", new
-                {
-                    how = surface.How, x = surface.X, y = surface.Y, width = surface.Width, height = surface.Height, show,
-                    usedCache, skippedPos = same, jsX, jsY, hostMode = "owned-popup", ownerClass = WebviewSurface.ClassName(surface.Parent),
-                    ownerLeft = ownerBox.Left, ownerTop = ownerBox.Top, ownerRight = ownerBox.Right, ownerBottom = ownerBox.Bottom,
-                    vx = NativeWindow.GetSystemMetrics(76), vy = NativeWindow.GetSystemMetrics(77),
-                    vw = NativeWindow.GetSystemMetrics(78), vh = NativeWindow.GetSystemMetrics(79),
-                    placedLeft = placed.Left, placedTop = placed.Top, placedRight = placed.Right, placedBottom = placed.Bottom,
-                    popup = host.Popup, child = host.Child, isChildOfOwner = host.IsChildOfOwner,
-                    parent = host.Parent, hwndParent = host.HwndParent, style = host.Style,
-                    insetLeft = placed.Left - ownerBox.Left, insetTop = placed.Top - ownerBox.Top,
-                    trusted = WebviewSurface.IsTrustedHow(surface.How),
-                    elapsedMs = (long)Stopwatch.GetElapsedTime(started).TotalMilliseconds
-                });
-                // #endregion
                 if (sizeChanged) QueueViewLayout();
                 if (cssDiff) ScheduleBeaconCalibrate();
-                if (becomingVisible) RestoreUiActivation();
-                UpdateOwnerTracking();
+                if (becomingVisible) RevealAfterLayout();
+                else UpdateOwnerTracking();
             }
             finally { placing = false; }
         }
@@ -1613,7 +1540,6 @@ internal static class OleDocumentHost
         internal void RestoreUiActivation()
         {
             if (ShellCopy || documentView is null) return;
-            var started = Stopwatch.GetTimestamp();
             try
             {
                 documentView.UIActivate(1);
@@ -1621,8 +1547,22 @@ internal static class OleDocumentHost
                 documentView.Show(1);
             }
             catch { }
+        }
+        private void RevealAfterLayout()
+        {
+            ApplyViewLayout();
+            RestoreUiActivation();
+            RedrawWindow(Handle, IntPtr.Zero, IntPtr.Zero, RdwInvalidate | RdwUpdatenow | RdwAllChildren);
+            if (ViewHandle != IntPtr.Zero)
+                RedrawWindow(ViewHandle, IntPtr.Zero, IntPtr.Zero, RdwInvalidate | RdwUpdatenow | RdwAllChildren);
+            NativeWindow.PumpWait(15);
+            var frame = ClientRect();
+            Visible = true;
+            ShowWindow(Handle, SwShowNoActivate);
+            UpdateOwnerTracking();
             // #region agent log
-            DebugNdjson.Write("H", "OleSite.RestoreUiActivation", "restore_ui", new { elapsedMs = (long)Stopwatch.GetElapsedTime(started).TotalMilliseconds, borderT, borderB, visible = Visible });
+            DebugNdjson.Probe("D", "OleDocumentSite.RevealAfterLayout", "reveal",
+                new { w = frame.Right - frame.Left, h = frame.Bottom - frame.Top });
             // #endregion
         }
         internal void ActivateInPlace()
@@ -1632,49 +1572,18 @@ internal static class OleDocumentHost
             var rect = ClientRect();
             var isDoc = Object is IOleDocument;
             var isInplace = Object is IOleInPlaceObject;
-            // #region agent log
-            DebugNdjson.Write("A", "OleDocumentHost.ActivateInPlace", "do_verb_start", new { verb = "show", isDoc, isInplace });
-            // #endregion
             if (!isDoc && !isInplace)
                 throw new CoreFault("ole_embed_failed", "This Office file cannot be hosted in the editor tab.");
-            int shown;
-            try { shown = Object.DoVerb(OleIverbShow, IntPtr.Zero, this, 0, Handle, ref rect); }
-            catch (Exception error)
-            {
-                // #region agent log
-                DebugNdjson.Write("A", "OleDocumentHost.ActivateInPlace", "do_verb_threw", new { type = error.GetType().Name, hr = error.HResult });
-                // #endregion
-                throw;
-            }
-            // #region agent log
-            DebugNdjson.Write("A", "OleDocumentHost.ActivateInPlace", "do_verb_done", new { shown });
-            // #endregion
+            int shown = Object.DoVerb(OleIverbShow, IntPtr.Zero, this, 0, Handle, ref rect);
             if (shown != SOk)
             {
                 int primary = Object.DoVerb(OleIverbPrimary, IntPtr.Zero, this, 0, Handle, ref rect);
                 int inplace = primary == SOk ? SOk : Object.DoVerb(OleIverbInPlaceActivate, IntPtr.Zero, this, 0, Handle, ref rect);
-                // #region agent log
-                DebugNdjson.Write("A", "OleDocumentHost.ActivateInPlace", "do_verb_inplace", new { primary, inplace, isDoc });
-                // #endregion
                 if (primary != SOk && inplace != SOk && !isDoc)
                     Marshal.ThrowExceptionForHR(shown);
             }
             if (!viewActivated) CompleteActivation();
-            var hosted = TryBindViewHandle();
-            var host = NativeWindow.DescribeHost(Handle, nestedOwner);
-            var frame = ClientRect();
-            var view = ViewportRect();
-            // #region agent log
-            DebugNdjson.Write("E", "OleDocumentHost.ActivateInPlace", "view_bind", new
-            {
-                hosted, view = ViewHandle.ToInt64(), hostHwnd = Handle.ToInt64(),
-                popup = host.Popup, child = host.Child,
-                borderL, borderT, borderR, borderB,
-                frameW = frame.Right - frame.Left, frameH = frame.Bottom - frame.Top,
-                viewL = view.Left, viewT = view.Top, viewR = view.Right, viewB = view.Bottom
-            });
-            // #endregion
-            if (!hosted)
+            if (!TryBindViewHandle())
                 throw new InvalidOperationException("The Office view is not hosted in the native container.");
             Trace("native_child_verified");
         }
@@ -1775,9 +1684,6 @@ internal static class OleDocumentHost
         {
             if (documentView is null || Object is null) return false;
             var hr = documentView.Clone(target, out var cloned);
-            // #region agent log
-            DebugNdjson.Write("A", "OleSite.TryCloneView", "clone", new { hr });
-            // #endregion
             if (hr != SOk || cloned is null) return false;
             target.documentView = cloned;
             target.Object = Object;
@@ -1796,9 +1702,6 @@ internal static class OleDocumentHost
         {
             if (Object is not IOleDocument document) return false;
             var hr = document.CreateView(this, IntPtr.Zero, 0, out var view);
-            // #region agent log
-            DebugNdjson.Write("A", "OleSite.TryCreateDocumentView", "create_view", new { hr });
-            // #endregion
             if (hr != SOk || view is null) return false;
             documentView = view;
             try { view.SetInPlaceSite(this); } catch { }
@@ -1826,7 +1729,7 @@ internal static class OleDocumentHost
         {
             if (msg == WmErasebkgnd)
             {
-                if (!ShellCopy)
+                if (!ShellCopy && documentView is null)
                 {
                     NativeWindow.GetClientRect(hwnd, out var client);
                     FillRect(wParam, ref client, GetStockObject(WhiteBrush));
@@ -1893,9 +1796,6 @@ internal static class OleDocumentHost
             finally { EndPaint(hwnd, ref paint); }
             if (Interlocked.Increment(ref copyPaintLogs) <= 6)
             {
-                // #region agent log
-                DebugNdjson.Write("M", "OleSite.PaintSharedCopy", "copy_paint", new { hypothesisId = "H7", runId = "post-fix", printed, blit, srcW, srcH, dstW, dstH });
-                // #endregion
             }
         }
 
@@ -1904,9 +1804,6 @@ internal static class OleDocumentHost
             if (iid == typeof(IOleCommandTarget).GUID)
             {
                 ppv = Marshal.GetComInterfaceForObject(this, typeof(IOleCommandTarget), CustomQueryInterfaceMode.Ignore);
-                // #region agent log
-                DebugNdjson.Write("B", "OleSite.GetInterface", "qi_cmdtarget", new { ok = ppv != IntPtr.Zero });
-                // #endregion
                 return CustomQueryInterfaceResult.Handled;
             }
             ppv = IntPtr.Zero;
@@ -1931,18 +1828,12 @@ internal static class OleDocumentHost
                 lastSaveError = "";
                 RefreshSourceStamp();
                 Trace("source_save_completed");
-                // #region agent log
-                DebugNdjson.Write("B", "OleSite.SaveObject", "save_ok", new { length = new FileInfo(DocumentPath).Length, bound = SourceBound, saveOnClose = SaveOnClose });
-                // #endregion
                 return SOk;
             }
             catch (Exception error)
             {
                 lastSaveError = error is CoreFault fault ? fault.Code : "save_failed";
                 RecordFailure("save_source", error);
-                // #region agent log
-                DebugNdjson.Write("B", "OleSite.SaveObject", "save_fail", new { type = error.GetType().Name, hr = error.HResult });
-                // #endregion
                 return Marshal.GetHRForException(error);
             }
             finally { saving = false; }
@@ -1952,9 +1843,6 @@ internal static class OleDocumentHost
             ppmk = IntPtr.Zero;
             if (string.IsNullOrEmpty(DocumentPath)) return ENotimpl;
             var hr = CreateFileMoniker(DocumentPath, out ppmk);
-            // #region agent log
-            DebugNdjson.Write("B", "OleSite.GetMoniker", "moniker", new { dwAssign, dwWhichMoniker, hr });
-            // #endregion
             return hr;
         }
         public int GetContainer(out IntPtr ppContainer)
@@ -1970,7 +1858,7 @@ internal static class OleDocumentHost
         public int LockContainer(int fLock) => SOk;
         public int ShowObject()
         {
-            try { if (CanRevealAtAnchor()) ShowWindow(Handle, 8); }
+            try { if (CanRevealAtAnchor()) ShowWindow(Handle, SwShowNoActivate); }
             catch { /* A late OLE callback must not reveal an unverified rectangle. */ }
             return SOk;
         }
@@ -2038,9 +1926,6 @@ internal static class OleDocumentHost
             borderL = nextL; borderT = nextT; borderR = nextR; borderB = nextB;
             if (changed)
             {
-                // #region agent log
-                DebugNdjson.Write("M", "OleSite.SetBorderSpace", "border", new { borderL, borderT, borderR, borderB, nullPtr = pborderwidths == IntPtr.Zero });
-                // #endregion
                 QueueViewLayout();
             }
             return SOk;
@@ -2062,7 +1947,10 @@ internal static class OleDocumentHost
             QueueViewLayout();
             return SOk;
         }
-        public int InsertMenus(IntPtr hmenuShared, IntPtr lpMenuWidths) => ENotimpl;
+        public int InsertMenus(IntPtr hmenuShared, IntPtr lpMenuWidths)
+        {
+            return SOk;
+        }
         public int SetMenu(IntPtr hmenuShared, IntPtr holemenu, IntPtr hwndActiveObject) => SOk;
         public int RemoveMenus(IntPtr hmenuShared) => SOk;
         public int SetStatusText(string pszStatusText) => SOk;
@@ -2073,9 +1961,6 @@ internal static class OleDocumentHost
             var msg = Marshal.PtrToStructure<NativeMessage>(lpmsg);
             if (msg.message == WmKeyDown && msg.wParam.ToInt64() == VkS && (GetKeyState(VkControl) & 0x8000) != 0)
             {
-                // #region agent log
-                DebugNdjson.Write("B", "OleSite.TranslateAccelerator", "ctrl_s", new { wID });
-                // #endregion
                 SaveObject();
                 return SOk;
             }
@@ -2084,38 +1969,23 @@ internal static class OleDocumentHost
         public int QueryStatus(IntPtr pguidCmdGroup, uint cCmds, IntPtr prgCmds, IntPtr pCmdText)
         {
             if (prgCmds == IntPtr.Zero || cCmds == 0) return ENotimpl;
-            var group = pguidCmdGroup == IntPtr.Zero ? Guid.Empty : Marshal.PtrToStructure<Guid>(pguidCmdGroup);
             var size = Marshal.SizeOf<OleCmd>();
-            var enabledSave = false;
-            var ids = new uint[Math.Min(cCmds, 12)];
             for (uint i = 0; i < cCmds; i++)
             {
                 var slot = IntPtr.Add(prgCmds, (int)(i * size));
                 var cmd = Marshal.PtrToStructure<OleCmd>(slot);
-                if (i < ids.Length) ids[i] = cmd.CmdId;
                 if (cmd.CmdId == OleCmdIdSave)
                 {
                     cmd.Cmdf = OleCmdFSupported | OleCmdFEnabled;
                     Marshal.StructureToPtr(cmd, slot, false);
-                    enabledSave = true;
                 }
-            }
-            if (Interlocked.Increment(ref queryStatusCalls) <= 12 || enabledSave)
-            {
-                // #region agent log
-                DebugNdjson.Write("B", "OleSite.QueryStatus", enabledSave ? "save_enabled" : "cmds", new { group = group.ToString("B"), cCmds, ids, enabledSave });
-                // #endregion
             }
             return SOk;
         }
         public int Exec(IntPtr pguidCmdGroup, uint nCmdID, uint nCmdexecopt, IntPtr pvaIn, IntPtr pvaOut)
         {
-            var group = pguidCmdGroup == IntPtr.Zero ? Guid.Empty : Marshal.PtrToStructure<Guid>(pguidCmdGroup);
             if (nCmdID == OleCmdIdSave)
             {
-                // #region agent log
-                DebugNdjson.Write("B", "OleSite.Exec", "save", new { group = group.ToString("B"), nCmdexecopt });
-                // #endregion
                 return SaveObject();
             }
             return ENotimpl;
@@ -2160,10 +2030,14 @@ internal static class OleDocumentHost
                 Trace("view_set_site");
                 Marshal.ThrowExceptionForHR(view.SetInPlaceSite(this));
                 Trace("view_ui_activate");
-                Marshal.ThrowExceptionForHR(view.UIActivate(1));
+                var uiHr = view.UIActivate(1);
+                if (uiHr != SOk && uiHr != ENotimpl) Marshal.ThrowExceptionForHR(uiHr);
+                if (uiHr == ENotimpl) Trace("view_ui_activate_skipped_notimpl");
                 ApplyViewLayout();
                 Trace("view_show");
-                Marshal.ThrowExceptionForHR(view.Show(1));
+                var showHr = view.Show(1);
+                if (showHr != SOk && showHr != ENotimpl) Marshal.ThrowExceptionForHR(showHr);
+                if (showHr == ENotimpl) Trace("view_show_skipped_notimpl");
                 ApplyViewLayout();
                 viewActivated = true;
             }
@@ -2433,7 +2307,7 @@ internal static class OleDocumentHost
         public int RetryRejectedCall(IntPtr task, int tickCount, int rejectType) => 150;
         public int MessagePending(IntPtr task, int tickCount, int pendingType)
         {
-            NativeWindow.PumpWait(10);
+            OfficeDialogAck.Pulse();
             return 2;
         }
     }
@@ -2504,45 +2378,53 @@ internal static class OleDocumentHost
         return frames;
     }
 
+    private static readonly HashSet<string> OfficeServerNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "WINWORD", "EXCEL", "POWERPNT", "VISIO", "ONENOTE", "ONENOTEM", "MSPUB", "WINPROJ"
+    };
+
     private static void HideNewFrames(List<IntPtr> existing, IntPtr host, HashSet<uint> protectPids)
     {
         var hidden = 0;
-        var skipped = 0;
-        var hiddenClasses = new List<string>();
+        var hiddenNames = new List<string>();
+        var names = new Dictionary<uint, string>();
         NativeWindow.EnumProc callback = (window, _) =>
         {
             if (window == host || NativeWindow.IsChild(host, window) || existing.Contains(window) || IsOwnContainer(window))
                 return true;
             var owned = NativeWindow.GetWindow(window, 4);
             if (owned == host || (owned != IntPtr.Zero && NativeWindow.IsChild(host, owned)))
-            {
-                skipped++;
                 return true;
-            }
             NativeWindow.GetWindowThreadProcessId(window, out var pid);
-            if (pid == 0 || protectPids.Contains(pid))
-            {
-                skipped++;
-                return true;
-            }
+            if (pid == 0 || protectPids.Contains(pid)) return true;
             var className = WebviewSurface.ClassName(window);
             if (className is "#32770" or "NUIDialog"
                 || className.StartsWith("bosa_sdm", StringComparison.OrdinalIgnoreCase)
-                || className.Contains("Dialog", StringComparison.OrdinalIgnoreCase))
-            {
-                skipped++;
+                || className.Contains("Dialog", StringComparison.OrdinalIgnoreCase)
+                || className.StartsWith("Chrome_", StringComparison.OrdinalIgnoreCase))
                 return true;
-            }
             if (!NativeWindow.IsWindowVisible(window)) return true;
-            if (hiddenClasses.Count < 8) hiddenClasses.Add(WebviewSurface.ClassName(window));
+            if (!names.TryGetValue(pid, out var processName))
+            {
+                try
+                {
+                    using var process = Process.GetProcessById((int)pid);
+                    processName = process.ProcessName;
+                }
+                catch { processName = ""; }
+                names[pid] = processName;
+            }
+            if (!OfficeServerNames.Contains(processName)) return true;
             ShowWindow(window, SwHide);
             hidden++;
+            if (hiddenNames.Count < 8) hiddenNames.Add(processName + ":" + className);
             return true;
         };
         NativeWindow.EnumWindows(callback, IntPtr.Zero);
         GC.KeepAlive(callback);
         // #region agent log
-        DebugNdjson.Write("C", "OleDocumentHost.HideNewFrames", "hide_new_frames", new { existing = existing.Count, hidden, skipped, protect = protectPids.Count, hiddenClasses });
+        DebugNdjson.Probe("A", "OleDocumentHost.HideNewFrames", hidden == 0 ? "none" : "hid",
+            new { hidden, names = hiddenNames });
         // #endregion
     }
 
@@ -2554,6 +2436,7 @@ internal static class OleDocumentHost
     }
 
     [DllImport("user32.dll")] private static extern bool ShowWindow(IntPtr hwnd, int command);
+    [DllImport("user32.dll")] private static extern bool RedrawWindow(IntPtr hwnd, IntPtr rect, IntPtr region, uint flags);
     [DllImport("user32.dll")] private static extern short GetKeyState(int virtualKey);
     private const uint QsAllInput = 0x04FF;
     [DllImport("user32.dll")] private static extern bool PeekMessage(out NativeMessage msg, IntPtr hwnd, uint min, uint max, uint remove);

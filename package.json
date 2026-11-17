@@ -97,6 +97,11 @@
       {
         "command": "officeInEditor.showReference",
         "title": "Office: Show Reference"
+      },
+      {
+        "command": "officeInEditor.toggleAckAlerts",
+        "title": "自动确认警告",
+        "icon": "$(check)"
       }
     ],
     "viewsContainers": {
@@ -121,6 +126,13 @@
         {
           "command": "officeInEditor.refresh",
           "when": "view == officeInEditor.inbox",
+          "group": "navigation"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "officeInEditor.toggleAckAlerts",
+          "when": "activeCustomEditorId == officeInEditor.document",
           "group": "navigation"
         }
       ]

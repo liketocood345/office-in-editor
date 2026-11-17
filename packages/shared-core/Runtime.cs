@@ -187,45 +187,37 @@ internal static class DebugNdjson
     private const int Capacity = 64;
     private static readonly object Gate = new();
     private static readonly Queue<object> Events = new();
-    private static readonly System.Net.Http.HttpClient Http = new() { Timeout = TimeSpan.FromMilliseconds(250) };
-    private static readonly string[] Ingest =
-    [
-        "http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093",
-        "http://127.0.0.1:7884/ingest/93344ccb-bd6f-4fa7-8e2d-f58c925f8e0b"
-    ];
 
     internal static void Write(string hypothesisId, string location, string message, object? data)
     {
-        var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        if (!AppContext.TryGetSwitch("OfficeInEditor.Diagnostics", out var enabled) || !enabled) return;
+        lock (Gate)
+        {
+            if (Events.Count == Capacity) Events.Dequeue();
+            Events.Enqueue(new { hypothesisId, location, message, timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() });
+        }
+    }
+
+    internal static object[] Snapshot() { lock (Gate) return Events.ToArray(); }
+
+    // #region agent log
+    internal static void Probe(string hypothesisId, string location, string message, object? data)
+    {
         try
         {
             var line = System.Text.Json.JsonSerializer.Serialize(new
             {
                 sessionId = "4dd893",
+                runId = "hygiene",
                 hypothesisId,
                 location,
                 message,
                 data,
-                timestamp
+                timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
             });
-            foreach (var url in Ingest)
-            {
-                var request = new System.Net.Http.HttpRequestMessage(System.Net.Http.HttpMethod.Post, url)
-                {
-                    Content = new System.Net.Http.StringContent(line, Encoding.UTF8, "application/json")
-                };
-                request.Headers.TryAddWithoutValidation("X-Debug-Session-Id", "4dd893");
-                _ = Http.SendAsync(request);
-            }
+            File.AppendAllText("h:" + Path.DirectorySeparatorChar + Path.Combine(".cursor", "debug-4dd893.log"), line + Environment.NewLine);
         }
-        catch { /* Debug ingest must never block Office. */ }
-        if (!AppContext.TryGetSwitch("OfficeInEditor.Diagnostics", out var enabled) || !enabled) return;
-        lock (Gate)
-        {
-            if (Events.Count == Capacity) Events.Dequeue();
-            Events.Enqueue(new { hypothesisId, location, message, timestamp });
-        }
+        catch { }
     }
-
-    internal static object[] Snapshot() { lock (Gate) return Events.ToArray(); }
+    // #endregion
 }

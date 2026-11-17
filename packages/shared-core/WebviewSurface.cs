@@ -7,7 +7,7 @@ namespace OfficeInEditor.Core;
 
 /// <summary>
 /// Resolves a planted editor token to its own IDE root and physical screen rectangle.
-/// No foreground-window or size-based window selection is used.
+/// Foreground only orders which IDE is searched first; size is never used to pick a window.
 /// </summary>
 internal static class WebviewSurface
 {
@@ -48,6 +48,8 @@ internal static class WebviewSurface
         internal readonly double PixelRatio = pixelRatio;
         internal bool Poked;
         internal int Nodes;
+        internal int Owners;
+        internal int Surfaces;
     }
 
     internal static bool IsToken(string? token)
@@ -193,18 +195,18 @@ internal static class WebviewSurface
             if (found is not null)
             {
                 var elapsedMs = (long)Stopwatch.GetElapsedTime(started).TotalMilliseconds;
-                if (elapsedMs >= 100)
-                {
-                    // #region agent log
-                    DebugNdjson.Write("T", "WebviewSurface.Resolve", "resolve_timing", new { hypothesisId = "T1", runId = "post-fix", elapsedMs, attempts, timeoutMs, how = found.Value.How, expectedWidth, expectedHeight });
-                    // #endregion
-                }
+                // #region agent log
+                if (elapsedMs >= 80 || attempts > 1)
+                    DebugNdjson.Probe("I", "WebviewSurface.Resolve", "hit",
+                        new { elapsedMs, attempts, how = found.Value.How, owners = search.Owners, surfaces = search.Surfaces });
+                // #endregion
                 return found;
             }
             if (Environment.TickCount64 >= until)
             {
                 // #region agent log
-                DebugNdjson.Write("T", "WebviewSurface.Resolve", "resolve_miss", new { hypothesisId = "T1", runId = "post-fix", elapsedMs = (long)Stopwatch.GetElapsedTime(started).TotalMilliseconds, attempts, timeoutMs, expectedWidth, expectedHeight });
+                DebugNdjson.Probe("I", "WebviewSurface.Resolve", "miss",
+                    new { elapsedMs = (long)Stopwatch.GetElapsedTime(started).TotalMilliseconds, attempts, owners = search.Owners, surfaces = search.Surfaces });
                 // #endregion
                 return null;
             }
@@ -460,13 +462,18 @@ internal static class WebviewSurface
     {
         // Each native root supplies both the search scope and the eventual owner.
         // A token discovered under one IDE can never be attached to another IDE.
+        // Search editor webviews first. FindFirst on the workbench root walks the
+        // whole Cursor tree and starves other IDE windows of the resolve budget.
         var owners = IdeFrames().ToArray();
+        search.Owners = owners.Length;
         var uia = UiaCom.Create();
         try
         {
             foreach (var owner in owners)
             {
-                foreach (var hwnd in SurfaceWindows(owner))
+                var surfaces = SurfaceWindows(owner).ToArray();
+                search.Surfaces += surfaces.Length;
+                foreach (var hwnd in surfaces)
                 {
                     if (!search.Poked) PokeUia(hwnd);
                     UiaCom.IElement? root = null;
@@ -625,6 +632,13 @@ internal static class WebviewSurface
         var height = Math.Max(32, owner.Height - insetTop - insetBottom);
         return new(owner.X + insetLeft, owner.Y + insetTop, width, height);
     }
+
+    /// <summary>
+    /// Chromium briefly reports a token rectangle closer to the IDE origin while a
+    /// hidden webview is becoming visible. That is not a real editor-pane move.
+    /// </summary>
+    internal static bool ShiftedTowardOwnerOrigin(ScreenBounds owner, ScreenBounds current, ScreenBounds next, int slack = 8) =>
+        next.X - owner.X < current.X - owner.X - slack || next.Y - owner.Y < current.Y - owner.Y - slack;
 
     internal static bool TryBounds(object? value, out int x, out int y, out int width, out int height)
     {
@@ -802,12 +816,18 @@ internal static class WebviewSurface
         NativeWindow.EnumProc callback = (window, _) => { if (IsIdeRoot(window)) frames.Add(window); return true; };
         NativeWindow.EnumWindows(callback, IntPtr.Zero);
         GC.KeepAlive(callback);
+        var foreground = NativeWindow.GetAncestor(NativeWindow.GetForegroundWindow(), 2);
+        var index = foreground == IntPtr.Zero ? -1 : frames.IndexOf(foreground);
+        if (index > 0)
+        {
+            frames.RemoveAt(index);
+            frames.Insert(0, foreground);
+        }
         return frames;
     }
 
     private static IEnumerable<IntPtr> SurfaceWindows(IntPtr owner)
     {
-        yield return owner;
         var children = new List<IntPtr>();
         NativeWindow.EnumChildProc callback = (window, _) =>
         {
@@ -818,6 +838,14 @@ internal static class WebviewSurface
         };
         NativeWindow.EnumChildWindows(owner, callback, IntPtr.Zero);
         GC.KeepAlive(callback);
+        // Workbench-root FindFirst walks every sidebar/chat/tab and starves other
+        // IDE windows. Prefer editor chrome children; fall back to the root only
+        // when this frame has no visible Chrome_ surfaces.
+        if (children.Count == 0)
+        {
+            yield return owner;
+            yield break;
+        }
         foreach (var child in children) yield return child;
     }
 

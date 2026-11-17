@@ -18,7 +18,7 @@ namespace OfficeInEditor.OfficeAddin
             internal object NativeWindow;
             internal string Path, SessionId;
             internal long Window;
-            internal bool SourceVerified, Periodic, SaveOnClose = true;
+            internal bool SourceVerified, Periodic, SaveOnClose = true, AckAlerts = true;
             internal int Seconds;
         }
         private List<Binding> bindings = new List<Binding>();
@@ -52,7 +52,8 @@ namespace OfficeInEditor.OfficeAddin
                 nativeWindows.TryGetValue(window, out object nativeWindow);
                 next.Add(new Binding { Document = document, NativeWindow = nativeWindow, Path = Path.GetFullPath(path), SessionId = session, Window = window,
                     SourceVerified = Json.IsTrue(Json.Get(item, "sourceVerified")), Periodic = Json.IsTrue(Json.Get(item, "periodicSave")), Seconds = seconds,
-                    SaveOnClose = Json.Get(item, "saveOnClose") == null || Json.IsTrue(Json.Get(item, "saveOnClose")) });
+                    SaveOnClose = Json.Get(item, "saveOnClose") == null || Json.IsTrue(Json.Get(item, "saveOnClose")),
+                    AckAlerts = Json.Get(item, "ackAlerts") == null || Json.IsTrue(Json.Get(item, "ackAlerts")) });
             }
             bindings = next;
             var expired = new List<long>();

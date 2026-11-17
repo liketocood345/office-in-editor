@@ -23,6 +23,7 @@ internal sealed class NativeSessionFiles
     private static readonly HashSet<string> ActiveDirectories = new(StringComparer.OrdinalIgnoreCase);
     private static readonly Regex SessionPattern = new("^ole-[a-fA-F0-9]{32}$", RegexOptions.CultureInvariant);
     private static readonly Regex BackupPattern = new("^b-([a-f0-9]{32})-([a-f0-9]{32})$", RegexOptions.CultureInvariant);
+    private static readonly Regex OwnedName = new("^(session\\.json|(?:working|previous)(?:-[a-f0-9]{32})?\\.[a-z0-9]{1,12}|backup-[a-f0-9]{32}\\.(?:json|[a-z0-9]{1,12}))$", RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
     private readonly string root, directory, extension, sourceKey;
     private SourceVersion version;
     private bool pendingSave, recoveryNeeded, cleaned;
@@ -33,12 +34,13 @@ internal sealed class NativeSessionFiles
     {
         SourcePath = source; this.root = root; this.directory = directory; this.extension = extension;
         this.version = version; sourceKey = PathKey(source);
-        WorkingPath = Path.Combine(directory, "working" + extension);
+        var stamp = Path.GetFileName(directory)[2..];
+        WorkingPath = Path.Combine(directory, "working-" + stamp + extension);
     }
 
     internal string SourcePath { get; }
     internal string WorkingPath { get; }
-    internal string PreviousPath => Path.Combine(directory, "previous" + extension);
+    internal string PreviousPath => Path.Combine(directory, "previous-" + Path.GetFileName(directory)[2..] + extension);
     private static string DefaultRoot => Path.Combine(RuntimeIdentity.DataRoot, "NativeSessions");
 
     // dataRoot is an isolated filesystem root for non-Office tests; production callers omit it.
@@ -60,14 +62,8 @@ internal sealed class NativeSessionFiles
             var before = SessionDirectories(root).Count;
             var reclaimed = ReclaimOrphanSessions(root);
             var dirCount = SessionDirectories(root).Count;
-            // #region agent log
-            DebugNdjson.Write("R", "NativeSessionFiles.Create", "quota", new { hypothesisId = "H6", runId = "post-fix", before, reclaimed, dirCount, sessionLimit = SessionLimit, exists = Directory.Exists(directory) });
-            // #endregion
             if (Directory.Exists(directory) || dirCount >= SessionLimit)
             {
-                // #region agent log
-                DebugNdjson.Write("R", "NativeSessionFiles.Create", "recovery_limit", new { hypothesisId = "H6", runId = "post-fix", exists = Directory.Exists(directory), dirCount });
-                // #endregion
                 throw Fault("recovery_limit", "Native session recovery capacity is full.");
             }
             string copyFrom = source;
@@ -197,7 +193,7 @@ internal sealed class NativeSessionFiles
             DeleteOwned(root, backup.Snapshot);
             DeleteOwned(root, backup.MetadataPath);
             var directory = Path.GetDirectoryName(backup.MetadataPath)!;
-            if (!ActiveDirectories.Contains(directory) && !File.Exists(Path.Combine(directory, "working" + backup.Metadata.Extension))
+            if (!ActiveDirectories.Contains(directory) && !Directory.EnumerateFiles(directory, "working*").Any()
                 && !Directory.EnumerateFiles(directory, "backup-*.json").Any())
             {
                 DeleteOwned(root, Path.Combine(directory, "session.json"));
@@ -230,7 +226,7 @@ internal sealed class NativeSessionFiles
             catch { continue; }
             if (names.Any(name => name.StartsWith("~$", StringComparison.Ordinal)
                 || name.StartsWith("backup-", StringComparison.OrdinalIgnoreCase)
-                || name.StartsWith("previous.", StringComparison.OrdinalIgnoreCase)))
+                || name.StartsWith("previous", StringComparison.OrdinalIgnoreCase)))
                 continue;
             try
             {
@@ -336,13 +332,6 @@ internal sealed class NativeSessionFiles
                 var entries = zip.Entries.Where(e => e.FullName.Replace('\\', '/') == "word/document.xml").ToArray();
                 if (entries.Length != 1 || entries[0].Length > 64L * 1024 * 1024)
                 {
-                    // #region agent log
-                    DebugNdjson.Write("B", "NativeSessionFiles.Inspect", "word_zip_invalid", new
-                    {
-                        names = zip.Entries.Select(e => e.FullName).Take(12).ToArray(),
-                        docs = entries.Length
-                    });
-                    // #endregion
                     throw new InvalidDataException();
                 }
                 using var xml = entries[0].Open();
@@ -425,7 +414,7 @@ internal sealed class NativeSessionFiles
         var directory = Path.GetDirectoryName(Path.GetFullPath(path))!;
         if (!string.Equals(Path.GetDirectoryName(directory), Path.GetFullPath(root), StringComparison.OrdinalIgnoreCase)
             || !Regex.IsMatch(Path.GetFileName(directory), "^s-[a-f0-9]{32}$", RegexOptions.CultureInvariant)
-            || !Regex.IsMatch(Path.GetFileName(path), "^(session\\.json|(?:working|previous)\\.[a-z0-9]{1,12}|backup-[a-f0-9]{32}\\.(?:json|[a-z0-9]{1,12}))$", RegexOptions.CultureInvariant))
+            || !OwnedName.IsMatch(Path.GetFileName(path)))
             throw Fault("invalid_path", "Recovery cleanup refused an unowned path.");
         PlainPath(path);
         if (File.Exists(path)) File.Delete(path);

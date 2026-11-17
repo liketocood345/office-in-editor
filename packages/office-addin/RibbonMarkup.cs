@@ -46,6 +46,7 @@ namespace OfficeInEditor.OfficeAddin
                 + "</group><group id=\"OieSaveGroup\" label=\"本地保存\">"
                 + "<toggleButton id=\"OieSavePeriodic\" label=\"定时保存\" getPressed=\"GetSavePeriodic\" onAction=\"SetSavePeriodic\"/>"
                 + "<toggleButton id=\"OieSaveOnClose\" label=\"关标签保存\" getPressed=\"GetSaveOnClose\" onAction=\"SetSaveOnClose\"/>"
+                + "<toggleButton id=\"OieAckAlerts\" label=\"自动确认警告\" getPressed=\"GetAckAlerts\" onAction=\"SetAckAlerts\"/>"
                 + "<editBox id=\"OieSaveInterval\" label=\"间隔（秒）\" getText=\"GetSaveInterval\" onChange=\"SetSaveInterval\" maxLength=\"4\"/>"
                 + "</group></tab></tabs></ribbon>";
         }

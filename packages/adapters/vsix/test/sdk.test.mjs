@@ -30,6 +30,7 @@ test("webview boot reports ready and geometry without global collisions; ACK sto
     window: { innerWidth: 900, innerHeight: 600, devicePixelRatio: 1, addEventListener: (name, handler) => { listeners[name] = handler; } },
     requestAnimationFrame: callback => callback(),
     ResizeObserver: class { observe() {} }, setTimeout: callback => timers.push(callback),
+    setInterval: () => 1, clearInterval: () => {},
   });
   runInContext("const status = 'existing browser binding';", context);
   const surfaceToken = "oie-surface-" + "a".repeat(32);
@@ -48,6 +49,13 @@ test("webview boot reports ready and geometry without global collisions; ACK sto
   assert.equal(html.includes(surfaceToken + ":tl"), true);
   assert.equal(html.includes("oie-surface-label"), false);
   assert.equal(html.includes("open-external"), false);
+  assert.equal(html.includes("host-loader-line"), true);
+  assert.equal(html.includes("status-dots"), true);
+  assert.equal(html.includes('id="status-loader"'), false);
+  const loaded = ui.hostHtml("Test", "正在加载 Office", surfaceToken, { background: "#FFFFFF", foreground: "#201F1E", loaderSrc: "https://example.invalid/beitou.gif", cspSource: "https://example.invalid" });
+  assert.equal(loaded.includes('width="90"'), true);
+  assert.equal(loaded.includes('id="status-loader"'), true);
+  assert.equal(loaded.includes("img-src https://example.invalid"), true);
   assert.equal(timers.length, 6);
   listeners.message({ data: { kind: "layout-ack" } });
   for (const callback of timers) callback();

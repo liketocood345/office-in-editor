@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
-using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -132,11 +131,18 @@ namespace OfficeInEditor.OfficeAddin
         { try { return selection?.Documents.Embedded.Find(selection.Documents.Active()); } catch { return null; } }
         public bool GetSavePeriodic(object control) => ActiveBinding()?.Periodic ?? autoSave?.Periodic ?? false;
         public bool GetSaveOnClose(object control) => ActiveBinding()?.SaveOnClose ?? true;
+        public bool GetAckAlerts(object control) => ActiveBinding()?.AckAlerts ?? true;
         public string GetSaveInterval(object control) => (ActiveBinding()?.Seconds ?? autoSave?.Seconds ?? 60).ToString();
         public void SetSaveOnClose(object control, bool enabled)
         {
             var binding = ActiveBinding();
             if (binding != null) ConfigureEmbeddedSaveOnClose(binding, enabled);
+            Invalidate();
+        }
+        public void SetAckAlerts(object control, bool enabled)
+        {
+            var binding = ActiveBinding();
+            if (binding != null) ConfigureEmbeddedAckAlerts(binding, enabled);
             Invalidate();
         }
         public void SetSavePeriodic(object control, bool enabled)
@@ -185,11 +191,7 @@ namespace OfficeInEditor.OfficeAddin
         {
             try
             {
-                bool enabled = !disconnected && selection != null && Volatile.Read(ref busy) == 0;
-                if (!enabled)
-                    DebugSession("C", "OfficeAddin.GetSendEnabled", "disabled",
-                        "{\"disconnected\":" + (disconnected ? "true" : "false") + ",\"hasSelection\":" + (selection != null ? "true" : "false") + "}");
-                return enabled;
+                return !disconnected && selection != null && Volatile.Read(ref busy) == 0;
             }
             catch { return false; }
         }
@@ -206,8 +208,6 @@ namespace OfficeInEditor.OfficeAddin
         public void RepurposeFileSave(object control, ref bool cancelDefault)
         {
             cancelDefault = true;
-            DebugSession("B", "OfficeAddin.RepurposeFileSave", "ribbon_save",
-                "{\"disconnected\":" + (disconnected ? "true" : "false") + "}");
             try { BeginRibbonSave(); } catch { }
         }
         public string GetStatusLabel(object control) { try { return status; } catch { return ""; } }
@@ -333,8 +333,6 @@ namespace OfficeInEditor.OfficeAddin
             try
             {
                 TraceLoad("AddToChat");
-                DebugSession("C", "OfficeAddin.AddToChat", "clicked",
-                    "{\"disconnected\":" + (disconnected ? "true" : "false") + "}");
                 BeginAddToChat();
             }
             catch { Interlocked.Exchange(ref busy, 0); }
@@ -403,6 +401,20 @@ namespace OfficeInEditor.OfficeAddin
                 try
                 {
                     await RegisterAsync(false).ConfigureAwait(false);
+                    if (string.IsNullOrEmpty(sessionId))
+                    {
+                        try { await RefreshDocumentBindingsAsync().ConfigureAwait(false); }
+                        catch { }
+                        try
+                        {
+                            await OnUiAsync(() =>
+                            {
+                                object document = selection.Documents.Resolve(documentId);
+                                sessionId = selection.Documents.Embedded.Find(document)?.SessionId;
+                            }).ConfigureAwait(false);
+                        }
+                        catch { }
+                    }
                     await core.CallAsync("office.document.bind", Json.Object("officeId", instanceId,
                         "documentId", documentId, "sessionId", sessionId)).ConfigureAwait(false);
                     // Resolve the destination first in Core; captureSelection is then
@@ -413,9 +425,6 @@ namespace OfficeInEditor.OfficeAddin
                         "routeVersion", routeVersion, "requestId", requestId)).ConfigureAwait(false);
                     bool queued = Json.IsTrue(Json.Get(delivered, "queued"));
                     string reason = Json.Text(delivered, "reason");
-                    DebugSession("C", "OfficeAddin.BeginAddToChat", queued ? "queued" : "not_queued",
-                        "{\"queued\":" + (queued ? "true" : "false") + ",\"reason\":\"" + (reason ?? "") + "\",\"hasSession\":" +
-                        (string.IsNullOrEmpty(sessionId) ? "false" : "true") + "}");
                     await OnUiAsync(() =>
                     {
                         status = queued ? "已投递到聊天输入框"
@@ -426,8 +435,6 @@ namespace OfficeInEditor.OfficeAddin
                 }
                 catch (Exception error)
                 {
-                    DebugSession("C", "OfficeAddin.BeginAddToChat", "error",
-                        "{\"type\":\"" + error.GetType().Name + "\"}");
                     await OnUiAsync(() => status = "未投递").ConfigureAwait(false);
                     if (manual) await ShowErrorAsync(error).ConfigureAwait(false);
                 }
@@ -510,6 +517,25 @@ namespace OfficeInEditor.OfficeAddin
                 catch (Exception error) { await ShowErrorAsync(error).ConfigureAwait(false); }
             });
         }
+        private void ConfigureEmbeddedAckAlerts(EmbeddedDocumentBindings.Binding binding, bool enabled)
+        {
+            string documentId = selection.Documents.Bind(binding.Document), sessionId = binding.SessionId;
+            Task.Run(async () =>
+            {
+                try
+                {
+                    await core.CallAsync("office.configure_save_window", Json.Object("officeId", sessionId,
+                        "documentId", documentId, "ackAlerts", enabled)).ConfigureAwait(false);
+                    await OnUiAsync(() =>
+                    {
+                        var current = selection.Documents.Embedded.Find(selection.Documents.Resolve(documentId));
+                        if (current != null && current.SessionId == sessionId) current.AckAlerts = enabled;
+                        status = "";
+                    }).ConfigureAwait(false);
+                }
+                catch (Exception error) { await ShowErrorAsync(error).ConfigureAwait(false); }
+            });
+        }
 
         private async Task RegisterAsync(bool ensure)
         {
@@ -571,33 +597,6 @@ namespace OfficeInEditor.OfficeAddin
         public void OnAddInsUpdate(ref Array custom) { }
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
         private static extern void OutputDebugString(string message);
-        private static void DebugSession(string hypothesisId, string location, string message, string dataJson)
-        {
-            ThreadPool.QueueUserWorkItem(_ =>
-            {
-                try
-                {
-                    var body = "{\"sessionId\":\"4dd893\",\"hypothesisId\":\"" + hypothesisId + "\",\"location\":\"" + location +
-                        "\",\"message\":\"" + message + "\",\"data\":" + dataJson + ",\"timestamp\":" +
-                        DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + "}";
-                    var bytes = Encoding.UTF8.GetBytes(body);
-                    foreach (string url in new[] {
-                        "http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093",
-                        "http://127.0.0.1:7884/ingest/93344ccb-bd6f-4fa7-8e2d-f58c925f8e0b" })
-                    {
-                        var request = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(url);
-                        request.Method = "POST";
-                        request.ContentType = "application/json";
-                        request.Headers["X-Debug-Session-Id"] = "4dd893";
-                        request.Timeout = 250;
-                        request.ContentLength = bytes.Length;
-                        using (var stream = request.GetRequestStream()) stream.Write(bytes, 0, bytes.Length);
-                        using (var response = request.GetResponse()) { }
-                    }
-                }
-                catch { }
-            });
-        }
         private static void TraceLoad(string step)
         {
             try

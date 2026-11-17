@@ -110,20 +110,8 @@ public sealed partial class CoreState : IAsyncDisposable
             }
             if (method == "office.open")
             {
-                // #region agent log
-                DebugNdjson.Write("F", "CoreState.InvokeAsync", "office_open_params", new
-                {
-                    hasPath = parameters?["path"] is not null,
-                    mode = Wire.Text(parameters, "mode", 16, false),
-                    hasHostId = parameters?["hostId"] is not null,
-                    hasHostLease = parameters?["hostLease"] is not null,
-                    hasHostEpoch = parameters?["hostEpoch"] is not null,
-                    hasSessionId = parameters?["sessionId"] is not null,
-                    width = Wire.Number(parameters, "width"),
-                    height = Wire.Number(parameters, "height")
-                });
-                // #endregion
                 lock (sync) ValidateOpeningHost(parameters, ownerPid);
+                OfficeDialogAck.Enabled = Wire.OptionalBoolean(parameters, "ackAlerts") ?? OfficeDialogAck.Enabled;
                 var opened = await Task.Run(() => NativeOfficeLauncher.Open(
                 Wire.Text(parameters, "path", 32767),
                 Wire.Text(parameters, "mode", 16, false) is { Length: > 0 } requested ? requested : "external",
@@ -140,7 +128,7 @@ public sealed partial class CoreState : IAsyncDisposable
                 Office[] targets;
                 lock (sync) targets = offices.Values.Where(item => item.Pid == Wire.Number(opened, "pid")).ToArray();
                 using var refreshDeadline = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
-                refreshDeadline.CancelAfter(TimeSpan.FromMilliseconds(500));
+                refreshDeadline.CancelAfter(TimeSpan.FromMilliseconds(2000));
                 foreach (var target in targets)
                     try { await PipeClient.CallAsync(target.PipeName, "refreshDocumentBindings", OleDocumentHost.SourceBindingsForProcess(target.Pid), refreshDeadline.Token); } catch { }
                 return opened;
@@ -176,7 +164,7 @@ public sealed partial class CoreState : IAsyncDisposable
                     "host.list" => Wire.Node(hosts.Values.Select(item => new { hostId = item.Id, kind = item.Kind, label = item.Label }).ToArray()),
                     "chat.register" => RegisterChat(parameters, ownerPid),
                     "chat.list" => Wire.Node(chats.Values.Select(PublicChat).ToArray()),
-                    "chat.defaultTarget" => DefaultTarget(),
+                    "chat.defaultTarget" => DefaultTarget(ownerPid),
                     "chat.unregister" => UnregisterChat(parameters),
                     "office.register" => RegisterOffice(parameters, ownerPid),
                     "office.document.bind" => BindDocument(parameters, ownerPid),
@@ -285,9 +273,6 @@ public sealed partial class CoreState : IAsyncDisposable
         };
         chats.Add(id, chat);
         MarkActivity(chat);
-        // #region agent log
-        DebugNdjson.Write("C", "CoreState.RegisterHost", "host_composer_chat", new { hostId = host.Id, kind = host.Kind });
-        // #endregion
     }
     private JsonNode? UnregisterHost(JsonNode? value)
     {
@@ -464,9 +449,18 @@ public sealed partial class CoreState : IAsyncDisposable
         chat.ActivitySequence = ++activitySequence;
         ownerCurrentChat[chat.OwnerId] = chat.Id;
     }
-    private JsonNode? DefaultTarget()
+    private JsonNode? DefaultTarget(int pid)
     {
-        var chat = chats.Values.OrderByDescending(item => item.ActivitySequence).FirstOrDefault();
+        var hostsForPid = sessionOwners.Values
+            .Where(item => item.ServerPid == pid)
+            .Select(item => item.HostId)
+            .Distinct()
+            .Take(2)
+            .ToArray();
+        IEnumerable<Chat> pool = chats.Values;
+        if (hostsForPid.Length == 1)
+            pool = pool.Where(item => item.HostId == hostsForPid[0]);
+        var chat = pool.OrderByDescending(item => item.ActivitySequence).FirstOrDefault();
         return chat is null ? new JsonObject() : Wire.Node(PublicChat(chat));
     }
     private Delivery Queue(string refId, string targetId, string requestId, string fingerprint)
@@ -492,9 +486,6 @@ public sealed partial class CoreState : IAsyncDisposable
     {
         if (target.HostId.Length == 0 || !hosts.TryGetValue(target.HostId, out var host))
         {
-            // #region agent log
-            DebugNdjson.Write("C", "CoreState.NotifyHost", "delivery_skip", new { hasHostId = target.HostId.Length > 0, hostKnown = target.HostId.Length > 0 && hosts.ContainsKey(target.HostId) });
-            // #endregion
             return;
         }
         var reference = GetReference(refId);
@@ -503,9 +494,6 @@ public sealed partial class CoreState : IAsyncDisposable
             var text = selection[key] is JsonValue scalar && scalar.TryGetValue<string>(out var value) ? value : "";
             return text.Length > max ? text[..max] : text;
         }
-        // #region agent log
-        DebugNdjson.Write("C", "CoreState.NotifyHost", "delivery_write", new { hostIdLen = target.HostId.Length, textLen = Field(reference.Selection, "text", 8192).Length });
-        // #endregion
         var node = Wire.Node(new
         {
             requestId = delivery.RequestId,
