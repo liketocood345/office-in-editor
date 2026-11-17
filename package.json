@@ -159,7 +159,12 @@
         ],
         "priority": "default"
       }
-    ]
+    ],
+    "configurationDefaults": {
+      "files.exclude": {
+        "**/~$*": true
+      }
+    }
   },
   "scripts": {
     "build": "node scripts/build.mjs",

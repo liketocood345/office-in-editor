@@ -198,8 +198,14 @@ internal static class OleDocumentHost
         if (method == "office.detach_window" && opening.TryGetValue(requestedId, out var pending))
         {
             try { pending.Cancel(); } catch (ObjectDisposedException) { }
+            // #region agent log
+            DebugNdjson.Write("C", "OleDocumentHost.TryHandleWindow", "detach_cancel_opening", new { hypothesisId = "C", runId = "close-geo", sessionPrefix = requestedId.Length > 12 ? requestedId[4..12] : requestedId });
+            // #endregion
             result = Wire.Node(new { attached = false, cancellationRequested = true });
-            if (!sessionHosts.TryGetValue(requestedId, out _)) return true;
+            if (!sessionHosts.TryGetValue(requestedId, out var openingHost)) return true;
+            Session? inFlight;
+            lock (openingHost.Gate) openingHost.Sessions.TryGetValue(requestedId, out inFlight);
+            if (inFlight is null) return true;
         }
         if (string.IsNullOrEmpty(requestedId) || !sessionHosts.TryGetValue(requestedId, out var host))
         {
@@ -444,6 +450,11 @@ internal static class OleDocumentHost
             });
             DebugNdjson.Write("A", "OleDocumentHost.OpenOnSta", "open_reveal", new { visible, shown = site.Visible, kindKey = kind.Key, periodicSave = site.PeriodicSave, interval = site.SaveIntervalSeconds, saveOnClose = site.SaveOnClose });
             // #endregion
+            if (cancellation.IsCancellationRequested)
+            {
+                CloseOnSta(session, host, discard: true);
+                throw new OperationCanceledException(cancellation);
+            }
             return Wire.Node(new
             {
                 opened = true,
@@ -780,14 +791,16 @@ internal static class OleDocumentHost
         var site = session.Site;
         var remaining = CountSharedViews(host, site);
         var lastView = remaining <= 1;
-        try { site.Place(session.SurfaceToken, false, session.Width, session.Height, 400, session.JsX, session.JsY); }
-        catch { /* Hide before save/close so the popup cannot outlive the tab. */ }
+        var existingFrames = SnapshotVisibleTopLevel();
+        var protectPids = ProtectedPids(site.Handle);
+        var hostHwnd = site.Handle;
         // #region agent log
         DebugNdjson.Write("C", "OleDocumentHost.CloseOnSta", "close_begin", new
         {
             lastView, remaining, alias = session.SharedAlias, ownObject = site.OwnObject,
             saveOnClose = site.Shared?.SaveOnClose ?? site.SaveOnClose, discard, dirty = site.IsDirty,
-            sessionPrefix = session.Id.Length > 12 ? session.Id[4..12] : session.Id
+            sessionPrefix = session.Id.Length > 12 ? session.Id[4..12] : session.Id,
+            hwnd = hostHwnd.ToInt64()
         });
         // #endregion
         if (!lastView)
@@ -808,6 +821,11 @@ internal static class OleDocumentHost
         if (site.ShellCopy && !ReferenceEquals(site, owner))
             try { site.Dispose(); } catch { /* Copy HWND is gone; close the primary object next. */ }
         var saveOnClose = owner.Shared?.SaveOnClose ?? owner.SaveOnClose;
+        var sourcePath = session.Path;
+        var workingPath = owner.Files.WorkingPath;
+        // #region agent log
+        ProbeOfficeLock(sourcePath, workingPath, "close_begin", releaseIfFree: false);
+        // #endregion
         if (saveOnClose && !discard)
         {
             try { owner.SaveObject(); }
@@ -815,6 +833,8 @@ internal static class OleDocumentHost
         }
         try
         {
+            try { if (owner.Object is IOleInPlaceObject inplace) { inplace.UIDeactivate(); inplace.InPlaceDeactivate(); } } catch { }
+            owner.ReleaseView();
             var sourceBeforeClose = 0L;
             try { sourceBeforeClose = new FileInfo(session.Path).Length; } catch { }
             var closed = owner.Object?.Close(OleCloseNosave) ?? SOk;
@@ -828,7 +848,6 @@ internal static class OleDocumentHost
         {
             try { owner.Files.MarkRecoveryNeeded(); } catch { }
         }
-        owner.ReleaseView();
         try { owner.Object?.SetClientSite(null!); } catch { }
         try { if (owner.Object is not null) OleSetContainedObject(owner.Object, 0); } catch { }
         lock (host.Gate)
@@ -841,6 +860,75 @@ internal static class OleDocumentHost
         try { owner.Files.DisposeClean(); } catch { }
         owner.OwnObject = true;
         owner.Dispose();
+        var hwndAlive = NativeWindow.IsWindow(hostHwnd);
+        try { SweepNewFrames(existingFrames, IntPtr.Zero, protectPids); } catch { }
+        ProbeOfficeLock(sourcePath, workingPath, "after_close", releaseIfFree: true);
+        // #region agent log
+        DebugNdjson.Write("C", "OleDocumentHost.CloseOnSta", "destroy_hwnd", new { hypothesisId = "C", runId = "close-geo", hwndAlive, lastView });
+        // #endregion
+    }
+
+    private static string? OfficeLockSibling(string documentPath)
+    {
+        try
+        {
+            var full = Path.GetFullPath(documentPath);
+            var name = Path.GetFileName(full);
+            var dir = Path.GetDirectoryName(full);
+            if (string.IsNullOrEmpty(name) || string.IsNullOrEmpty(dir) || name.StartsWith("~", StringComparison.Ordinal))
+                return null;
+            return Path.Combine(dir, "~$" + name);
+        }
+        catch { return null; }
+    }
+
+    private static bool OfficeLockHeld(string lockPath)
+    {
+        try
+        {
+            using var stream = new FileStream(lockPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+            return false;
+        }
+        catch { return true; }
+    }
+
+    private static (bool Exists, bool Held, bool Deleted) ReleaseOfficeLockIfFree(string? lockPath, bool releaseIfFree)
+    {
+        if (string.IsNullOrEmpty(lockPath) || !File.Exists(lockPath))
+            return (false, false, false);
+        var held = OfficeLockHeld(lockPath);
+        var deleted = false;
+        if (releaseIfFree && !held)
+        {
+            try
+            {
+                File.SetAttributes(lockPath, FileAttributes.Normal);
+                File.Delete(lockPath);
+                deleted = !File.Exists(lockPath);
+            }
+            catch { }
+        }
+        return (true, held, deleted);
+    }
+
+    private static void ProbeOfficeLock(string sourcePath, string workingPath, string phase, bool releaseIfFree)
+    {
+        var source = ReleaseOfficeLockIfFree(OfficeLockSibling(sourcePath), releaseIfFree);
+        var working = ReleaseOfficeLockIfFree(OfficeLockSibling(workingPath), releaseIfFree);
+        // #region agent log
+        DebugNdjson.Write("L1", "OleDocumentHost.ProbeOfficeLock", "office_lock", new
+        {
+            hypothesisId = "L1",
+            runId = "lock-leftover",
+            phase,
+            sourceExists = source.Exists,
+            sourceHeld = source.Held,
+            sourceDeleted = source.Deleted,
+            workingExists = working.Exists,
+            workingHeld = working.Held,
+            workingDeleted = working.Deleted
+        });
+        // #endregion
     }
 
     private static string StagingCopy(string path)

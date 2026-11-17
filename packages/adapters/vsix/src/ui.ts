@@ -122,7 +122,8 @@ function report(){
 }
 window.addEventListener('resize',report);
 new ResizeObserver(report).observe(document.body);
-for(const delay of [100,300,750,1500]) setTimeout(()=>{if(!acknowledged)report();},delay);
+if(root) new ResizeObserver(report).observe(root);
+for(const delay of [100,300,750,1500,3000,6000]) setTimeout(()=>{if(!acknowledged)report();},delay);
 report();
 })();
 </script></body></html>`;

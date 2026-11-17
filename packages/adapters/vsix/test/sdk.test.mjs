@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import * as net from "node:net";
 import { randomBytes } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 import { createContext, runInContext } from "node:vm";
@@ -16,6 +17,9 @@ const sdk = await import("data:text/javascript;base64," + Buffer.from(compiled.o
 const uiBuild = await build({ entryPoints: [fileURLToPath(new URL("../src/ui.ts", import.meta.url))],
   bundle: true, platform: "node", format: "esm", target: "node18", write: false, absWorkingDir: root });
 const ui = await import("data:text/javascript;base64," + Buffer.from(uiBuild.outputFiles[0].text).toString("base64"));
+const cacheBuild = await build({ entryPoints: [fileURLToPath(new URL("../src/office-cache.ts", import.meta.url))],
+  bundle: true, platform: "node", format: "esm", target: "node18", write: false, absWorkingDir: root });
+const cache = await import("data:text/javascript;base64," + Buffer.from(cacheBuild.outputFiles[0].text).toString("base64"));
 
 test("webview boot reports ready and geometry without global collisions; ACK stops retries", () => {
   const messages = [], timers = [], listeners = {};
@@ -44,7 +48,7 @@ test("webview boot reports ready and geometry without global collisions; ACK sto
   assert.equal(html.includes(surfaceToken + ":tl"), true);
   assert.equal(html.includes("oie-surface-label"), false);
   assert.equal(html.includes("open-external"), false);
-  assert.equal(timers.length, 4);
+  assert.equal(timers.length, 6);
   listeners.message({ data: { kind: "layout-ack" } });
   for (const callback of timers) callback();
   assert.equal(messages.length, 2);
@@ -53,6 +57,20 @@ test("webview boot reports ready and geometry without global collisions; ACK sto
   listeners.message({ data: { kind: "attached" } });
   assert.equal(nodes.status.hidden, true);
   assert.equal(html.includes("open-external"), false);
+});
+
+test("Office lock files map to the sibling document and are not hosted", () => {
+  assert.equal(cache.isOfficeCacheFileName("~$测试文档.docx"), true);
+  assert.equal(cache.officeCacheOwnerName("~$测试文档.docx"), "测试文档.docx");
+  assert.equal(cache.officeCacheOwnerName("~$Book.xlsx"), "Book.xlsx");
+  assert.equal(cache.officeCacheOwnerName("测试文档.docx"), undefined);
+  assert.equal(cache.officeCacheOwnerName("~WRL0001.tmp"), undefined);
+  assert.equal(cache.officeCacheOwnerName("~$"), undefined);
+  const mapped = cache.officeCacheOwnerPath("docs/~$测试文档.docx");
+  assert.equal(mapped.endsWith("测试文档.docx"), true);
+  assert.equal(mapped.includes("~$"), false);
+  const manifest = JSON.parse(readFileSync(new URL("../../../../package.json", import.meta.url), "utf8"));
+  assert.equal(manifest.contributes.configurationDefaults["files.exclude"]["**/~$*"], true);
 });
 
 test("editor document open uses an explicit bounded pipe budget", async () => {

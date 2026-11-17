@@ -15,6 +15,7 @@ import { ErrorNoticeBudget } from "./notices";
 import { actionButton, escapeHtml, hostHtml, panelHtml } from "./ui";
 import { tryHostBounds } from "./host-window";
 import { officeTabAppearance } from "./office-theme";
+import { isOfficeCacheFile, officeCacheOwnerPath } from "./office-cache";
 
 const REF_ID = /^(?:[a-f0-9]{32}|[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})$/iu;
 const DOCUMENT_EXTENSIONS = new Set([
@@ -25,10 +26,6 @@ const DOCUMENT_EXTENSIONS = new Set([
   ".one", ".onepkg",
   ".pub", ".mpp",
 ]);
-
-function isOfficeCacheFile(fsPath: string): boolean {
-  return path.basename(fsPath).startsWith("~");
-}
 
 function assertLocalAccess(): void {
   if (process.platform !== "win32") throw new OfficeBridgeError("UNSUPPORTED_PLATFORM");
@@ -67,16 +64,24 @@ function officeId(value: unknown): string | undefined {
   return undefined;
 }
 
-async function validateLocalDocument(uri: vscode.Uri): Promise<void> {
+async function validateLocalDocument(uri: vscode.Uri): Promise<vscode.Uri> {
   if (uri.scheme !== "file" || uri.authority
     || uri.fsPath.startsWith("\\\\")
     || !DOCUMENT_EXTENSIONS.has(path.extname(uri.fsPath).toLowerCase())) {
     throw new OfficeBridgeError("INVALID_DOCUMENT");
   }
-  if (isOfficeCacheFile(uri.fsPath)) throw new OfficeBridgeError("office_cache_file");
+  const targetPath = isOfficeCacheFile(uri.fsPath) ? officeCacheOwnerPath(uri.fsPath) : uri.fsPath;
+  if (!targetPath || isOfficeCacheFile(targetPath)
+    || !DOCUMENT_EXTENSIONS.has(path.extname(targetPath).toLowerCase())) {
+    throw new OfficeBridgeError(isOfficeCacheFile(uri.fsPath) ? "office_cache_file" : "INVALID_DOCUMENT");
+  }
   try {
-    if (!(await stat(uri.fsPath)).isFile()) throw new OfficeBridgeError("INVALID_DOCUMENT");
-  } catch { throw new OfficeBridgeError("INVALID_DOCUMENT"); }
+    if (!(await stat(targetPath)).isFile()) throw new OfficeBridgeError("INVALID_DOCUMENT");
+  } catch (error) {
+    if (error instanceof OfficeBridgeError) throw error;
+    throw new OfficeBridgeError(isOfficeCacheFile(uri.fsPath) ? "office_cache_file" : "INVALID_DOCUMENT");
+  }
+  return targetPath === uri.fsPath ? uri : vscode.Uri.file(targetPath);
 }
 
 class OfficeExtension implements vscode.Disposable {
@@ -363,7 +368,7 @@ class OfficeExtension implements vscode.Disposable {
 
   private async chooseDocument(argument?: unknown): Promise<vscode.Uri | undefined> {
     const provided = argument instanceof vscode.Uri ? argument : undefined;
-    if (provided) { await validateLocalDocument(provided); return provided; }
+    if (provided) return validateLocalDocument(provided);
     const selection = await vscode.window.showOpenDialog({
       canSelectFiles: true,
       canSelectFolders: false,
@@ -372,8 +377,7 @@ class OfficeExtension implements vscode.Disposable {
       filters: { "Office 文档": ["docx", "doc", "xlsx", "xls", "pptx", "ppt", "vsdx", "vsd", "one", "pub", "mpp", "rtf"] },
     });
     const uri = selection?.[0];
-    if (uri) await validateLocalDocument(uri);
-    return uri;
+    return uri ? validateLocalDocument(uri) : undefined;
   }
 
   private async retainOfficePreviewTabs(tabs: readonly vscode.Tab[]): Promise<void> {
@@ -384,10 +388,12 @@ class OfficeExtension implements vscode.Disposable {
       if (this.convertingPreview.has(key)) continue;
       this.convertingPreview.add(key);
       try {
+        // A second openWith disposes the live webview. Preview tabs that are
+        // already our custom editor only keepEditor when they can take focus.
         // #region agent log
-        fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "B", location: "extension.ts:retainOfficePreviewTabs", message: "convert_preview", data: { preview: tab.isPreview, active: tab.isActive }, timestamp: Date.now() }) }).catch(() => {});
+        fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "B", location: "extension.ts:retainOfficePreviewTabs", message: "convert_preview", data: { preview: tab.isPreview, active: tab.isActive, via: tab.isActive ? "keepEditor" : "defer" }, timestamp: Date.now() }) }).catch(() => {});
         // #endregion
-        await vscode.commands.executeCommand("vscode.openWith", tab.input.uri, "officeInEditor.document", { preview: false, preserveFocus: true });
+        if (tab.isActive) await vscode.commands.executeCommand("workbench.action.keepEditor");
       } catch { /* Office tabs must not stay in the default preview-replace slot. */ }
       finally {
         setTimeout(() => this.convertingPreview.delete(key), 2000);
@@ -406,10 +412,20 @@ class OfficeExtension implements vscode.Disposable {
     panel.webview.options = { enableScripts: true, localResourceRoots: [] };
     const name = displayText(path.basename(uri.fsPath));
     if (isOfficeCacheFile(uri.fsPath)) {
-      panel.webview.html = hostHtml(name, "这是 Office 缓存文件，不要打开。", "", officeTabAppearance());
+      const ownerPath = officeCacheOwnerPath(uri.fsPath);
+      let redirected = false;
+      if (ownerPath && !isOfficeCacheFile(ownerPath)) {
+        try {
+          if ((await stat(ownerPath)).isFile()) {
+            redirected = true;
+            await vscode.commands.executeCommand("vscode.openWith", vscode.Uri.file(ownerPath), "officeInEditor.document", { preview: false });
+          }
+        } catch { /* Owner missing; close the cache tab anyway. */ }
+      }
       // #region agent log
-      fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "C1", location: "extension.ts:hostDocument", message: "office_cache_file", data: { nameLen: name.length }, timestamp: Date.now() }) }).catch(() => {});
+      fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "L3", location: "extension.ts:hostDocument", message: redirected ? "cache_redirect" : "office_cache_file", data: { nameLen: name.length, hasOwner: Boolean(ownerPath), redirected, excluded: true }, timestamp: Date.now() }) }).catch(() => {});
       // #endregion
+      panel.dispose();
       return;
     }
     const sessionId = "ole-" + randomUUID().replaceAll("-", "");
@@ -425,6 +441,7 @@ class OfficeExtension implements vscode.Disposable {
     let officeId: string | undefined;
     let attached = false;
     let closed = false;
+    let openStarted = false;
     let bounds: import("../../../adapter-sdk/src").HostBounds | undefined;
     let layoutRunning = false;
     let layoutVersion = 0;
@@ -455,15 +472,22 @@ class OfficeExtension implements vscode.Disposable {
       attached = false;
       this.officeClosers.delete(close);
       this.officeAligners.delete(sessionId);
-      if (officeId && bounds) {
-        try { await this.broker.layoutOfficeWindow(officeId, { ...bounds, visible: false }); }
-        catch { /* Hide is best-effort; detach still destroys the HWND. */ }
-      }
+      const target = officeId ?? (openStarted ? sessionId : undefined);
       // #region agent log
-      fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "C", location: "extension.ts:close", message: "close_hide", data: { hasOffice: Boolean(officeId), hasBounds: Boolean(bounds) }, timestamp: Date.now() }) }).catch(() => {});
+      fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "C", location: "extension.ts:close", message: "close_hide", data: { hasOffice: Boolean(officeId), hasBounds: Boolean(bounds), openStarted, targetLen: target?.length ?? 0 }, timestamp: Date.now() }) }).catch(() => {});
       // #endregion
-      try { await this.broker.detachOfficeWindow(officeId ?? sessionId); }
-      catch { /* Closing the tab must not kill Word/Excel/PowerPoint. */ }
+      if (!target) return;
+      try {
+        const broker = await this.connect();
+        await broker.detachOfficeWindow(target);
+        // #region agent log
+        fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "C", location: "extension.ts:close", message: "detach_ok", data: { targetPrefix: target.slice(4, 12) }, timestamp: Date.now() }) }).catch(() => {});
+        // #endregion
+      } catch (error) {
+        // #region agent log
+        fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "C", location: "extension.ts:close", message: "detach_fail", data: { code: errorCode(error), targetPrefix: target.slice(4, 12) }, timestamp: Date.now() }) }).catch(() => {});
+        // #endregion
+      }
     };
     this.officeClosers.add(close);
     panel.webview.onDidReceiveMessage((message: unknown) => {
@@ -505,14 +529,15 @@ class OfficeExtension implements vscode.Disposable {
       fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "B", location: "extension.ts:keepOfficeTab", message: "tab_keep", data: { panelActive: panel.active, panelVisible: panel.visible, beforePreview: before?.isPreview ?? null, beforePinned: before?.isPinned ?? null, afterPreview: after?.isPreview ?? null, afterPinned: after?.isPinned ?? null }, timestamp: Date.now() }) }).catch(() => {});
       // #endregion
     };
+    const surfaceToken = "oie-surface-" + sessionId.slice(4);
+    panel.webview.html = hostHtml(name, "正在打开 Office…", surfaceToken, officeTabAppearance());
     void keepOfficeTab();
-    void this.retainOfficePreviewTabs(vscode.window.tabGroups.all.flatMap(group => group.tabs));
     panel.onDidChangeViewState(event => {
       // #region agent log
       fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "H", location: "extension.ts:viewState", message: "view_state", data: { visible: event.webviewPanel.visible, active: event.webviewPanel.active, attached, closed, hasOffice: Boolean(officeId) }, timestamp: Date.now() }) }).catch(() => {});
       // #endregion
       void panel.webview.postMessage({ kind: "layout-request" });
-      if (event.webviewPanel.active && attached && !closed) void keepOfficeTab();
+      if (event.webviewPanel.active && !closed) void keepOfficeTab();
       if (!officeId || closed || !bounds) return;
       void this.run(() => layout(bounds), false);
     }, undefined, this.context.subscriptions);
@@ -522,15 +547,12 @@ class OfficeExtension implements vscode.Disposable {
       // #endregion
       void close();
     }, undefined, this.context.subscriptions);
-    const surfaceToken = "oie-surface-" + sessionId.slice(4);
-    panel.webview.html = hostHtml(name, "正在打开 Office…", surfaceToken, officeTabAppearance());
     await this.run(async () => {
       const opening = this.connect();
       trace("connect_started");
       void opening.catch(() => {});
       const overallDeadline = performance.now() + 60_000;
-      const deadline = Date.now() + 8_000;
-      while (!closed && !bounds && Date.now() < deadline) {
+      while (!closed && !bounds && performance.now() < overallDeadline) {
         await panel.webview.postMessage({ kind: "layout-request" });
         await new Promise(resolve => setTimeout(resolve, 250));
       }
@@ -538,7 +560,7 @@ class OfficeExtension implements vscode.Disposable {
       if (!bounds) {
         trace("geometry_timeout");
         // #region agent log
-        fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "C", location: "extension.ts:geometry_timeout", message: "fail_no_external", data: { launchedExternal: false }, timestamp: Date.now() }) }).catch(() => {});
+        fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "C", location: "extension.ts:geometry_timeout", message: "fail_no_external", data: { launchedExternal: false, elapsedMs: Math.round(performance.now() - started) }, timestamp: Date.now() }) }).catch(() => {});
         // #endregion
         await panel.webview.postMessage({ kind: "status", text: "标签几何初始化失败。" });
         return;
@@ -558,6 +580,8 @@ class OfficeExtension implements vscode.Disposable {
         const remaining = overallDeadline - performance.now();
         if (remaining < 250) throw new OfficeBridgeError("HOST_WINDOW_UNAVAILABLE");
         trace("office_open_started");
+        openStarted = true;
+        officeId = sessionId;
         // #region agent log
         fetch("http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "4dd893" }, body: JSON.stringify({ sessionId: "4dd893", hypothesisId: "T1", location: "extension.ts:office_open", message: "embedded_request", data: { fallback: false, remainingMs: Math.round(remaining), visible: panel.visible, elapsedMs: Math.round(performance.now() - started), ...bounds }, timestamp: Date.now() }) }).catch(() => {});
         // #endregion

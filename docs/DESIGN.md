@@ -128,7 +128,7 @@ OneNote 现代客户端、仅云笔记本、无 `IOleObject`/`IOleDocument`/`IOl
 - 一次打开 **多个** 自定义编辑器标签（同一应用多种文件，或几种应用一起）；
 - **多种** 范围内 Office 同时处于打开中或已嵌套。
 - **同一原件的多个标签 / 多个 Cursor 窗口共用一份文档对象**。复制只发生在壳的窗口展示与交互层：每个标签一个容器 HWND，绑同一 `IOleObject`。**禁止**再 `IOleDocumentView.Clone` / `CreateView`（第二视图会抢走先开窗口的原位界面，表现为白屏）。额外窗口一律壳镜像：`PrintWindow` 把主容器 HWND 的画面拷到该标签 HWND，**不转发鼠标/键盘**。禁止为同文件再 `OleCreateFromFile`，禁止静默复制工作副本/从原件分流。最后一个标签拆除对象。
-- **Office 自定义编辑器不走默认预览「新换旧」**。`vscode.openWith` 用 `{ preview: false }`；标签出现时只 `keepEditor` 转成普通标签，**不得** `pinEditor`。并用 `tabGroups.onDidChangeTabs` 把仍为 preview 的 Office 标签转成普通标签。不得改全局 `workbench.editor.enablePreview`。
+- **Office 自定义编辑器不走默认预览「新换旧」**。首次 `vscode.openWith` 用 `{ preview: false }`。已在 `officeInEditor.document` 里的标签只 `keepEditor` 转成普通标签，**不得**再 `openWith`（会拆掉当前 webview，几何超时且留下 OLE 窗），**不得** `pinEditor`。`tabGroups.onDidChangeTabs` 同样只 `keepEditor`。不得改全局 `workbench.editor.enablePreview`。
 
 关闭：
 
@@ -152,7 +152,7 @@ OneNote 现代客户端、仅云笔记本、无 `IOleObject`/`IOleDocument`/`IOl
 - 加载项仍必须能在独立打开的范围内应用、以及 OLE 容器里的对应实例中加载；不在 Office 进程里创建 WinForms `Control` 或托管窗口过程。`OnConnection` 只保存 Application，管道与 Core 注册放到 `OnStartupComplete`。STA 回调用 APC 切回 Office 线程，不建 `HWND_MESSAGE`。新种类若没有 Application 加载项模型，嵌套仍走容器路径，MCP/Ribbon 能力按缺模型缩小。
 - 每个标签一次打开对应 **一条** OLE 会话。会话记住该次原位对象窗口的进程 ID。随后 `office.register` 若 pid 匹配某条嵌入会话，则该实例标为嵌入，接收 MCP 重绑。多种类、多标签可以同时有多条会话；不要用「全局只有一条 HasSession」挡打开。
 - 容器 HWND 先隐藏创建。几何只来自令牌/四角打点的屏幕矩形。禁止 `HWND_TOPMOST`、禁止为对齐去 `SetForegroundWindow`、禁止按其它窗口的宽高做匹配、禁止用 `window.screenX/Y` 把 popup 摆到 IDE 原点或铺满工作区。**第一次**用四角打点解析 IDE owner 与相对边距；之后 `SetWindowPos` 跟 owner 边距走。侧栏等外框不变、编辑区变时，空闲再用 `#ole-root` 的 CSS 尺寸校准（保持左/上边距）。尺寸变了才 `SetRect`。禁止空闲校准再走 UIA 全树 / `uia-token`、禁止 80ms/`PrintWindow` 轮询、禁止每次 layout 改窗口样式或 `UIDeactivate`。
-- 文件名以 `~` 开头的 Office 锁/缓存文件（如 `~$文档.docx`）不得打开；标签内提示「这是 Office 缓存文件，不要打开。」未 `open_ok` 时窗口保持隐藏；`ShowObject` 也不得在 attach 前把容器亮出来。`GetContainer` 返回自身 `IOleContainer`。按暂存副本 `OleCreateFromFile` 之后 `OleRun`，把 `IOleObject` 赋给站点，**表面已解析且仍隐藏** 时再原位激活，成功后再 Show。Word 会在 `DoVerb` 期间回调 `ActivateMe`，此时必须已经能 `CreateView`。关标签走 `office.detach_window` 只拆除 **该标签** 对应会话。
+- 文件名以 `~` 开头的 Office 锁/缓存文件（如 `~$文档.docx`）不得作为文档宿主。资源管理器默认隐藏 `**/~$*`，不把锁文件列成可点条目。误点 `~$文档.docx` 时打开同目录 `文档.docx` 的标签，并立刻关掉缓存标签，不提示「不要打开」。对不上原件时也关掉缓存标签，不留下空页。末视图 OLE `Close` 之后，若原件旁 `~$` 兄弟锁已无人占用，才删除该锁（Word 崩溃残留）；占用中的锁不删。Core 仍拒绝把缓存路径送进 OLE。未 `open_ok` 时窗口保持隐藏；`ShowObject` 也不得在 attach 前把容器亮出来。`GetContainer` 返回自身 `IOleContainer`。按暂存副本 `OleCreateFromFile` 之后 `OleRun`，把 `IOleObject` 赋给站点，**表面已解析且仍隐藏** 时再原位激活，成功后再 Show。Word 会在 `DoVerb` 期间回调 `ActivateMe`，此时必须已经能 `CreateView`。关标签走 `office.detach_window` 只拆除 **该标签** 对应会话。
 - **每种** Office 文档服务器一条 STA。该线程在空闲时泵消息（`MsgWaitForMultipleObjects` + `PeekMessage`），**在 `OleCreateFromFile` / `DoVerb` 等阻塞 COM 调用期间也必须泵**（`IMessageFilter.MessagePending`），否则 Excel/PPT 会在调用方 STA 上卡到标签 60 秒上限。不能只在每次 `Invoke` 返回后 `PeekMessage`。不同种类的 STA 互不阻塞。
 - 存在 **任意** 活动 OLE 会话时 Core 不算空闲，不得按 20 秒空闲把容器进程退出。全部会话拆除后才恢复空闲退出。
 
