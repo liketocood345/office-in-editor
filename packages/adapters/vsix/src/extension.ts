@@ -499,10 +499,14 @@ class OfficeExtension implements vscode.Disposable {
       trace("connect_started");
       void opening.catch(() => {});
       const overallDeadline = performance.now() + 60_000;
+      const geometryStarted = performance.now();
       while (!closed && !bounds && performance.now() < overallDeadline) {
         await panel.webview.postMessage({ kind: "layout-request" });
-        await new Promise(resolve => setTimeout(resolve, 250));
+        await new Promise(resolve => setTimeout(resolve, 50));
       }
+      // #region agent log
+      fetch('http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'4dd893'},body:JSON.stringify({sessionId:'4dd893',location:'extension.ts:geometry',message:'geometry_wait',data:{elapsedMs:Math.round(performance.now()-geometryStarted),hadBounds:!!bounds},timestamp:Date.now(),hypothesisId:'E',runId:'post-fix'})}).catch(()=>{});
+      // #endregion
       if (closed) { await opening; return; }
       if (!bounds) {
         trace("geometry_timeout");

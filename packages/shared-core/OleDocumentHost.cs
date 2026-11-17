@@ -251,15 +251,19 @@ internal static class OleDocumentHost
         List<IntPtr>? existingFrames = null;
         HashSet<uint>? protectPids = null;
         var exclusive = false;
+        var openedAt = Environment.TickCount64;
         try
         {
             site = new OleSite { DocumentPath = path, SourceBound = bindSource, Sta = host.Sta, PixelRatio = pixelRatio,
                 Files = NativeSessionFiles.Create(path, sessionId, backupId), ForceDirty = !string.IsNullOrEmpty(backupId), OwnObject = true, SaveOnClose = true, AckAlerts = OfficeDialogAck.Enabled };
             site.CreateWindow();
             Trace("container_created");
+            // #region agent log
+            DebugNdjson.Probe("H", "OleDocumentHost.OpenOnSta", "files_ready",
+                new { kind = kind.Key, elapsedMs = Environment.TickCount64 - openedAt });
+            // #endregion
             step = "place";
-            site.Place(surfaceToken, false, width, height, visible ? 6000 : 400, jsX, jsY);
-            NativeWindow.PumpWait(30);
+            site.Place(surfaceToken, false, width, height, 0, jsX, jsY);
             EnterOleExclusive(cancellation, kind.Key);
             exclusive = true;
             protectPids = ProtectedPids(site.Handle);
@@ -287,14 +291,14 @@ internal static class OleDocumentHost
                 step = "create";
                 Trace("ole_create_started");
                 var embedPath = site.Files.WorkingPath;
-                NativeWindow.PumpWait(30);
                 using (OfficeDialogAck.Scope(kind.ServerFile, site.AckAlerts))
                     unknown = CreateOleFromFile(site, storage, kind, embedPath, ref iid);
                 cancellation.ThrowIfCancellationRequested();
                 Trace("ole_create_completed");
-                SweepNewFrames(existingFrames ?? [], site.Handle, protectPids ?? []);
+                HideNewFrames(existingFrames ?? [], site.Handle, protectPids ?? []);
                 // #region agent log
-                DebugNdjson.Probe("E", "OleDocumentHost.OpenOnSta", "create_swept", new { kind = kind.Key });
+                DebugNdjson.Probe("E", "OleDocumentHost.OpenOnSta", "create_swept",
+                    new { kind = kind.Key, elapsedMs = Environment.TickCount64 - openedAt });
                 // #endregion
             }
             step = "cast";
@@ -364,8 +368,12 @@ internal static class OleDocumentHost
             step = "activate";
             Trace("activation_started");
             try { site.ActivateInPlace(); }
-            finally { SweepNewFrames(existingFrames ?? [], site.Handle, protectPids ?? []); }
+            finally { HideNewFrames(existingFrames ?? [], site.Handle, protectPids ?? []); }
             Trace("activation_completed");
+            // #region agent log
+            DebugNdjson.Probe("H", "OleDocumentHost.OpenOnSta", "activated",
+                new { kind = kind.Key, elapsedMs = Environment.TickCount64 - openedAt });
+            // #endregion
             session.Activated = true;
             GetWindowThreadProcessId(site.ViewHandle == IntPtr.Zero ? site.Handle : site.ViewHandle, out var documentPid);
             session.ServerPid = (int)documentPid;
@@ -377,9 +385,13 @@ internal static class OleDocumentHost
                 CloseOnSta(session, host);
                 throw new OperationCanceledException(cancellation);
             }
-            if (visible) site.Place(surfaceToken, true, width, height, 6000, jsX, jsY);
+            if (visible) site.Place(surfaceToken, true, width, height, 1200, jsX, jsY);
+            // #region agent log
+            DebugNdjson.Probe("H", "OleDocumentHost.OpenOnSta", "placed",
+                new { kind = kind.Key, elapsedMs = Environment.TickCount64 - openedAt, haveInsets = site.SurfaceReady });
+            // #endregion
             site.ResolveNativeObjectModel(kind.Application);
-            if (site.NativeObjectModelHandle == IntPtr.Zero)
+            if (kind.Application == "word" && site.NativeObjectModelHandle == IntPtr.Zero)
             {
                 NativeWindow.PumpWait(40);
                 site.ResolveNativeObjectModel(kind.Application);
@@ -392,7 +404,7 @@ internal static class OleDocumentHost
             }
             // #region agent log
             DebugNdjson.Probe("G", "OleDocumentHost.OpenOnSta", site.NativeObjectModelHandle == IntPtr.Zero ? "om_missing" : "om_ready",
-                new { kind = kind.Key, om = site.NativeObjectModelHandle != IntPtr.Zero });
+                new { kind = kind.Key, om = site.NativeObjectModelHandle != IntPtr.Zero, elapsedMs = Environment.TickCount64 - openedAt });
             // #endregion
             site.ConfigurePeriodicSave(true, 60);
             if (cancellation.IsCancellationRequested)
@@ -488,7 +500,7 @@ internal static class OleDocumentHost
             host.SessionCount = host.Sessions.Count;
         }
         sessionHosts[sessionId] = host;
-        if (visible) target.Place(surfaceToken, true, width, height, 6000, jsX, jsY);
+        if (visible) target.Place(surfaceToken, true, width, height, 1200, jsX, jsY);
         try { shared.Primary?.RestoreUiActivation(); } catch { /* Primary inplace must survive the copy HWND. */ }
         if (target.Handle != IntPtr.Zero) InvalidateRect(target.Handle, IntPtr.Zero, false);
         const string mode = "shell_copy";
@@ -1574,14 +1586,25 @@ internal static class OleDocumentHost
             var isInplace = Object is IOleInPlaceObject;
             if (!isDoc && !isInplace)
                 throw new CoreFault("ole_embed_failed", "This Office file cannot be hosted in the editor tab.");
-            int shown = Object.DoVerb(OleIverbShow, IntPtr.Zero, this, 0, Handle, ref rect);
-            if (shown != SOk)
+            var verbAt = Environment.TickCount64;
+            int inplace = Object.DoVerb(OleIverbInPlaceActivate, IntPtr.Zero, this, 0, Handle, ref rect);
+            int verb = OleIverbInPlaceActivate;
+            int hr = inplace;
+            if (inplace != SOk)
             {
-                int primary = Object.DoVerb(OleIverbPrimary, IntPtr.Zero, this, 0, Handle, ref rect);
-                int inplace = primary == SOk ? SOk : Object.DoVerb(OleIverbInPlaceActivate, IntPtr.Zero, this, 0, Handle, ref rect);
-                if (primary != SOk && inplace != SOk && !isDoc)
-                    Marshal.ThrowExceptionForHR(shown);
+                verb = OleIverbShow;
+                hr = Object.DoVerb(OleIverbShow, IntPtr.Zero, this, 0, Handle, ref rect);
+                if (hr != SOk)
+                {
+                    verb = OleIverbPrimary;
+                    hr = Object.DoVerb(OleIverbPrimary, IntPtr.Zero, this, 0, Handle, ref rect);
+                    if (hr != SOk && !isDoc) Marshal.ThrowExceptionForHR(inplace);
+                }
             }
+            // #region agent log
+            DebugNdjson.Probe("H", "OleSite.ActivateInPlace", "verb",
+                new { verb, hr, elapsedMs = Environment.TickCount64 - verbAt });
+            // #endregion
             if (!viewActivated) CompleteActivation();
             if (!TryBindViewHandle())
                 throw new InvalidOperationException("The Office view is not hosted in the native container.");
@@ -2429,11 +2452,7 @@ internal static class OleDocumentHost
     }
 
     private static void SweepNewFrames(List<IntPtr> existing, IntPtr host, HashSet<uint> protectPids)
-    {
-        HideNewFrames(existing, host, protectPids);
-        NativeWindow.PumpWait(120);
-        HideNewFrames(existing, host, protectPids);
-    }
+        => HideNewFrames(existing, host, protectPids);
 
     [DllImport("user32.dll")] private static extern bool ShowWindow(IntPtr hwnd, int command);
     [DllImport("user32.dll")] private static extern bool RedrawWindow(IntPtr hwnd, IntPtr rect, IntPtr region, uint flags);

@@ -57,7 +57,7 @@ internal sealed class NativeSessionFiles
             PlainPath(root);
             Directory.CreateDirectory(root);
             PlainPath(root);
-            var sourceVersion = Inspect(source, validateWord: ext == ".docx");
+            var sourceVersion = Inspect(source, validateWord: false);
             var directory = Path.Combine(root, "s-" + sessionId[4..].ToLowerInvariant());
             var before = SessionDirectories(root).Count;
             var reclaimed = ReclaimOrphanSessions(root);
@@ -74,7 +74,7 @@ internal sealed class NativeSessionFiles
                 if (backup.Metadata.SourceKey != PathKey(source) || backup.Metadata.SourceVersion != sourceVersion || backup.Metadata.Extension != ext)
                     throw Fault("document_conflict", "The source no longer matches this recovery snapshot.");
                 copyFrom = backup.Snapshot;
-                copyVersion = Inspect(copyFrom, validateWord: ext == ".docx");
+                copyVersion = Inspect(copyFrom, validateWord: false);
                 if (copyVersion.Length != backup.Metadata.Length || copyVersion.Hash != backup.Metadata.Hash)
                     throw Fault("invalid_backup", "The recovery snapshot has changed.");
             }

@@ -127,10 +127,20 @@ public sealed partial class CoreState : IAsyncDisposable
                 lock (sync) RememberOpenedSession(parameters, opened, ownerPid);
                 Office[] targets;
                 lock (sync) targets = offices.Values.Where(item => item.Pid == Wire.Number(opened, "pid")).ToArray();
-                using var refreshDeadline = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
-                refreshDeadline.CancelAfter(TimeSpan.FromMilliseconds(2000));
-                foreach (var target in targets)
-                    try { await PipeClient.CallAsync(target.PipeName, "refreshDocumentBindings", OleDocumentHost.SourceBindingsForProcess(target.Pid), refreshDeadline.Token); } catch { }
+                // #region agent log
+                DebugNdjson.Probe("A", "CoreState.office.open", "opened_before_refresh",
+                    new { targets = targets.Length });
+                // #endregion
+                if (targets.Length > 0)
+                {
+                    var refreshTargets = targets;
+                    _ = Task.Run(async () =>
+                    {
+                        using var refreshDeadline = new CancellationTokenSource(TimeSpan.FromMilliseconds(2000));
+                        foreach (var target in refreshTargets)
+                            try { await PipeClient.CallAsync(target.PipeName, "refreshDocumentBindings", OleDocumentHost.SourceBindingsForProcess(target.Pid), refreshDeadline.Token); } catch { }
+                    });
+                }
                 return opened;
             }
             if (method == "host.wait_delivery") return await WaitHostDeliveryAsync(parameters, ownerPid, cancellation);
