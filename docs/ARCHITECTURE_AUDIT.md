@@ -1,8 +1,10 @@
 # 架构补全与实现审查（2026-11-15）
 
+**2026-11-18 更新：** 下方 owned-popup 描述属于历史状态。当前是根窗口下实验性 `WS_CHILD`，尚无经验证的标签原生槽及 HTML 覆盖层契约；不得把子窗关系成功视为完整嵌入。最新结论和本轮安全修复见 [真实窗口承载](NATIVE_WINDOW_CONTAINMENT.md)。
+
 本文是对 0.1.4 工作区源码、设计手册和交接材料的静态审查。它补充设计约束，**不是修复完成、已安装版本或真实 Office 验收声明**。本次没有启动 Office、操作用户文档、修改安装或注册表。历史文档的测试仅对其注明的构建和模式有效。
 
-后续源码与 [DESIGN.md](DESIGN.md) 已把嵌套定为 owned popup 铺在 `#ole-root` 令牌矩形上（跨进程 `WS_CHILD` 进 Chromium 会并入输入队列）。几何、静默加载、保存按钮与仅定时保存以 DESIGN 为准。OleExclusive、HideNewFrames 对话框例外仍须活测。聊天官方 Hook 见 [后续代码复核](CODE_REVIEW_FOLLOWUP.md)。
+本审查当时（2026-11-15）的源码曾把嵌套做成 owned popup 铺在 `#ole-root` 令牌矩形上，理由是跨进程 `WS_CHILD` 进 Chromium 会并入输入队列。2026-11-18 起 [DESIGN.md](DESIGN.md) 已禁止 owned popup 薄壳，改为挂在 IDE 顶层窗口下、只占令牌矩形的 `WS_CHILD`（见首段更新）。几何、静默加载、保存按钮与仅定时保存以 DESIGN 为准。本文只审查原位 OLE 路线，不涉及 2026-11-21 起的焦点混合实验。OleExclusive、HideNewFrames 对话框例外仍须活测。聊天官方 Hook 见 [后续代码复核](CODE_REVIEW_FOLLOWUP.md)。
 
 ## 1. 当前实现与目标的区别
 
@@ -51,7 +53,7 @@ VS Code 公共 Custom Editor API 给出的是 Webview/文档生命周期，并�
 
 必须验证 token 与具体宿主、标签、原生父窗口的一一归属、裁剪和输入范围。发现的是共享 Chromium renderer/workbench 祖先或其它 IDE 的相似窗口时，应拒绝附着。禁止用宽高相似、全屏包含或最近窗口补足身份；不得覆盖聊天、侧栏或其它标签。仅能 SetParent 插件自己的容器，不能 SetParent Office 主框。若无法证明专属表面，保持短状态失败；不自动改成独立应用。
 
-现行定位辅助：标签 `#ole-root` 四角 1 像素黑点，Name 为 `{token}:tl|tr|bl|br`。Core 取角点并集，不得把 IDE 主客户区当编辑器。标签底色跟随 Office `UI Theme`，不跟随 Cursor 编辑器主题。
+现行定位辅助：标签 `#ole-root` 四角 1 像素黑点，Name 为 `{token}:tl|tr|bl|br`。Core 取角点并集，不得把 IDE 主客户区当编辑器。OLE 铺满内容区，不另做 Office 主题底色。
 
 ### 会话与文档身份
 

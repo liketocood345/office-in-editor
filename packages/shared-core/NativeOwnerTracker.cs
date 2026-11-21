@@ -250,6 +250,33 @@ internal sealed class NativeOwnerTracker : IDisposable
             return;
         }
         using var physical = new PhysicalCoordinates();
+        if (HostedChild(current))
+        {
+            if (!Native.GetClientRect(current.Owner, out var client)) return;
+            var clientBounds = client.Bounds;
+            var childDpi = Native.GetDpiForWindow(current.Owner);
+            if (needsAnchor || childDpi == 0 || current.Dpi != childDpi
+                || clientBounds.Width != current.AnchorOwner.Width || clientBounds.Height != current.AnchorOwner.Height)
+            {
+                needsAnchor = true;
+                HidePopup(current);
+                if (!invalidationNotified) { invalidationNotified = true; Notify(false); }
+                if ((pending & (MoveEnd | MinimizeEnd)) != 0) Notify(true);
+                return;
+            }
+            lock (gate)
+            {
+                if (disposed != 0 || binding.Generation != current.Generation) return;
+                if (current.DesiredVisible && !Native.IsWindowVisible(current.Popup))
+                    Native.SetWindowPos(current.Popup, IntPtr.Zero, current.AnchorPopup.X, current.AnchorPopup.Y,
+                        current.AnchorPopup.Width, current.AnchorPopup.Height,
+                        Native.NoActivate | Native.NoZOrder | Native.AsyncPosition | Native.ShowWindow);
+                // The parent already moves its child. Touching a visible child's
+                // Z order here competes with sibling surfaces and native overlays.
+            }
+            if ((pending & (MoveEnd | MinimizeEnd)) != 0) Notify(true);
+            return;
+        }
         if (!Native.GetWindowRect(current.Owner, out var owner)) return;
         var ownerBounds = owner.Bounds;
         var dpi = Native.GetDpiForWindow(current.Owner);
@@ -281,6 +308,10 @@ internal sealed class NativeOwnerTracker : IDisposable
         }
         if ((pending & (MoveEnd | MinimizeEnd)) != 0) Notify(true);
     }
+
+    private static bool HostedChild(Binding current) =>
+        (Native.GetWindowLong(current.Popup, Native.GwlStyle) & Native.WsChild) != 0
+        && Native.GetParent(current.Popup) == current.Owner;
 
     private bool IdentityMatches(Binding current) =>
         Native.IsWindow(current.Owner) && Native.IsWindow(current.Popup)
@@ -407,6 +438,7 @@ internal sealed class NativeOwnerTracker : IDisposable
             EventDestroy = 0x8001, EventShow = 0x8002, EventHide = 0x8003, EventLocation = 0x800B;
         internal const uint NoSize = 0x0001, NoMove = 0x0002, NoZOrder = 0x0004,
             NoActivate = 0x0010, ShowWindow = 0x0040, HideWindow = 0x0080, AsyncPosition = 0x4000;
+        internal const int GwlStyle = -16, WsChild = 0x40000000;
         internal delegate void WinEventProc(IntPtr hook, uint eventType, IntPtr hwnd, int objectId, int childId, uint eventThread, uint timestamp);
         [StructLayout(LayoutKind.Sequential)] internal struct Rect
         {
@@ -431,6 +463,9 @@ internal sealed class NativeOwnerTracker : IDisposable
         [DllImport("user32.dll")] internal static extern uint GetDpiForWindow(IntPtr hwnd);
         [DllImport("user32.dll")] internal static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
         [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] internal static extern bool GetWindowRect(IntPtr hwnd, out Rect rect);
+        [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] internal static extern bool GetClientRect(IntPtr hwnd, out Rect rect);
+        [DllImport("user32.dll")] internal static extern IntPtr GetParent(IntPtr hwnd);
+        [DllImport("user32.dll")] internal static extern int GetWindowLong(IntPtr hwnd, int index);
         [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] internal static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int width, int height, uint flags);
         [DllImport("user32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] internal static extern bool PostThreadMessage(uint thread, uint message, IntPtr wParam, IntPtr lParam);
         [DllImport("user32.dll")] internal static extern int GetMessage(out Message message, IntPtr hwnd, uint min, uint max);

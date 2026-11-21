@@ -8,7 +8,7 @@
   "private": true,
   "preview": true,
   "engines": {
-    "vscode": "^1.125.0"
+    "vscode": "^1.120.0"
   },
   "extensionKind": [
     "ui"
@@ -45,6 +45,41 @@
     }
   },
   "contributes": {
+    "configuration": {
+      "title": "Office in Editor",
+      "properties": {
+        "officeInEditor.hostRoute": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "focus",
+            "ole"
+          ],
+          "enumDescriptions": [
+            "Word, Excel and PowerPoint use the focus-hybrid route when the installed Core supports it; other formats use the in-place OLE route.",
+            "Always use the focus-hybrid route for Word, Excel and PowerPoint.",
+            "Always use the in-place OLE route."
+          ],
+          "default": "auto",
+          "description": "How an Office document is shown in its editor tab. Applies to tabs opened after the change."
+        },
+        "officeInEditor.pixelPolicy": {
+          "type": "string",
+          "enum": [
+            "always",
+            "switch",
+            "mouse"
+          ],
+          "enumDescriptions": [
+            "Keep capture warm while editing, for the fastest switch back to the preview.",
+            "Start capture only when Office leaves the foreground.",
+            "Start capture once the pointer moves while editing."
+          ],
+          "default": "always",
+          "description": "When the focus-hybrid route prepares the preview of a parked Office window."
+        }
+      }
+    },
     "commands": [
       {
         "command": "officeInEditor.refresh",
@@ -148,26 +183,66 @@
         "viewType": "officeInEditor.document",
         "displayName": "Office in Editor",
         "selector": [
-          { "filenamePattern": "*.docx" },
-          { "filenamePattern": "*.doc" },
-          { "filenamePattern": "*.docm" },
-          { "filenamePattern": "*.dotx" },
-          { "filenamePattern": "*.rtf" },
-          { "filenamePattern": "*.xlsx" },
-          { "filenamePattern": "*.xls" },
-          { "filenamePattern": "*.xlsm" },
-          { "filenamePattern": "*.xlsb" },
-          { "filenamePattern": "*.csv" },
-          { "filenamePattern": "*.pptx" },
-          { "filenamePattern": "*.ppt" },
-          { "filenamePattern": "*.pptm" },
-          { "filenamePattern": "*.vsdx" },
-          { "filenamePattern": "*.vsd" },
-          { "filenamePattern": "*.vstx" },
-          { "filenamePattern": "*.one" },
-          { "filenamePattern": "*.onepkg" },
-          { "filenamePattern": "*.pub" },
-          { "filenamePattern": "*.mpp" }
+          {
+            "filenamePattern": "*.docx"
+          },
+          {
+            "filenamePattern": "*.doc"
+          },
+          {
+            "filenamePattern": "*.docm"
+          },
+          {
+            "filenamePattern": "*.dotx"
+          },
+          {
+            "filenamePattern": "*.rtf"
+          },
+          {
+            "filenamePattern": "*.xlsx"
+          },
+          {
+            "filenamePattern": "*.xls"
+          },
+          {
+            "filenamePattern": "*.xlsm"
+          },
+          {
+            "filenamePattern": "*.xlsb"
+          },
+          {
+            "filenamePattern": "*.csv"
+          },
+          {
+            "filenamePattern": "*.pptx"
+          },
+          {
+            "filenamePattern": "*.ppt"
+          },
+          {
+            "filenamePattern": "*.pptm"
+          },
+          {
+            "filenamePattern": "*.vsdx"
+          },
+          {
+            "filenamePattern": "*.vsd"
+          },
+          {
+            "filenamePattern": "*.vstx"
+          },
+          {
+            "filenamePattern": "*.one"
+          },
+          {
+            "filenamePattern": "*.onepkg"
+          },
+          {
+            "filenamePattern": "*.pub"
+          },
+          {
+            "filenamePattern": "*.mpp"
+          }
         ],
         "priority": "default"
       }
@@ -192,7 +267,7 @@
     "@modelcontextprotocol/client": "2.4.0",
     "@modelcontextprotocol/ext-apps": "2.0.4",
     "@types/node": "24.10.1",
-    "@types/vscode": "1.125.0",
+    "@types/vscode": "1.120.0",
     "@vscode/test-electron": "3.1.0",
     "@vscode/vsce": "4.1.1",
     "esbuild": "0.28.2",

@@ -27,7 +27,7 @@ if ($assemblyName.Name -ne 'OfficeInEditor.Addin') { throw 'Unexpected add-in as
 if ((Get-FileHash -LiteralPath $payloadDll -Algorithm SHA256).Hash -ne (Get-FileHash -LiteralPath $installedDll -Algorithm SHA256).Hash) {
     throw 'Stable installed payload does not match the supplied Office payload.'
 }
-$codeBase = ([Uri]$installedDll).AbsoluteUri
+$codeBase = ([Uri]$installedDll).ToString()
 if ($OfficeBitness -eq 'Auto') {
     foreach ($probeView in @([Microsoft.Win32.RegistryView]::Registry64, [Microsoft.Win32.RegistryView]::Registry32)) {
         $machine = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, $probeView)
@@ -63,7 +63,7 @@ try {
         $server = $userRegistry.OpenSubKey($clsidPath + '\InprocServer32')
         if ($null -eq $server) { throw 'Add-in is not registered for the selected Office bitness.' }
         try {
-            if ($server.GetValue('CodeBase') -ne $codeBase -or $server.GetValue('Class') -ne $addinClass -or
+            if ($server.GetValue('CodeBase') -notin @($codeBase,([Uri]$installedDll).AbsoluteUri) -or $server.GetValue('Class') -ne $addinClass -or
                 $server.GetValue('Assembly') -ne $assemblyName.FullName) { throw 'COM registration does not match the stable installed payload.' }
         } finally { $server.Dispose() }
         foreach ($appName in $officeApps) {

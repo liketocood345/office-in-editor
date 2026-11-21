@@ -14,6 +14,8 @@ export interface CoreHealth {
     nativeOfficeEmbedding: boolean;
     nativeAutoSaveLocalRedirect: false;
     documentWrite: boolean;
+    /** True once Core serves the focus.* methods; hosts fall back to the OLE route otherwise. */
+    focusHybrid?: boolean;
     [key: string]: unknown;
   };
   appPort?: number | null;
@@ -99,6 +101,8 @@ export interface HostRegistration {
 export type BrokerMethod =
   | "health"
   | "host.register"
+  | "host.native_surface.register"
+  | "host.native_surface.release"
   | "host.unregister"
   | "host.wait_delivery"
   | "office.list"
@@ -115,7 +119,14 @@ export type BrokerMethod =
   | "reference.get"
   | "reference.release"
   | "reference.deliver"
-  | "chat.list";
+  | "chat.list"
+  | "focus.open"
+  | "focus.activate"
+  | "focus.layout"
+  | "focus.policy"
+  | "focus.close"
+  | "focus.status"
+  | "focus.wheel";
 
 export interface BrokerTransport {
   request<T = unknown>(

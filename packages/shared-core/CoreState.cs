@@ -68,15 +68,21 @@ public sealed partial class CoreState : IAsyncDisposable
         operations = new OperationJournal(Path.Combine(Path.GetFullPath(dataRoot), "operations"));
         idleTimer = new Timer(_ =>
         {
+            CoreTrace.Mark("idle", "timer");
             lock (sync)
                 if (!disposed && activeRequests == 0 && NoPersistentWork())
+                {
+                    CoreTrace.Mark("idle", "became-idle");
                     BecameIdle?.Invoke();
+                }
         });
         LoadReferences();
         try { NativeSessionFiles.ReclaimOrphans(); } catch { /* Startup must not fail because leftover staging exists. */ }
+        RestoreFocusOrphans();
     }
     private bool NoPersistentWork() =>
-        hosts.Count == 0 && offices.Count == 0 && chats.Count == 0 && runtimeOwners.Count == 0 && !OleDocumentHost.HasSession;
+        hosts.Count == 0 && offices.Count == 0 && chats.Count == 0 && runtimeOwners.Count == 0 && !OleDocumentHost.HasSession &&
+        focusSessions.Count == 0 && focusOpening.Count == 0;
     public void ScheduleIdleShutdown()
     {
         lock (sync)
@@ -87,17 +93,42 @@ public sealed partial class CoreState : IAsyncDisposable
     private static string Hash(string input) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(input))).ToLowerInvariant();
     private static bool ApplicationIsValid(string application) => application is "word" or "excel" or "powerpoint";
 
+    /// <summary>Starts the stall watchdog (broker process only; tests do not run it).</summary>
+    internal void StartDiagnostics()
+    {
+        lock (sync)
+        {
+            if (watchdog is not null) return;
+            watchdog = new StallWatchdog(Path.GetDirectoryName(referenceDirectory)!,
+                wait => { if (!Monitor.TryEnter(sync, wait)) return false; Monitor.Exit(sync); return true; },
+                () => focusDispatcher?.CurrentWork ?? (null, 0));
+            watchdog.Start();
+        }
+    }
+    private StallWatchdog? watchdog;
+
     public async Task<JsonNode?> InvokeAsync(string method, JsonNode? parameters, int ownerPid, CancellationToken cancellation)
     {
+        using var operation = CoreTrace.Begin("req:" + method);
         lock (sync) { ObjectDisposedException.ThrowIf(disposed, this); activeRequests++; idleTimer.Change(Timeout.Infinite, Timeout.Infinite); }
         try
         {
+            if (method is "host.native_surface.register" or "host.native_surface.release")
+            {
+                lock (sync)
+                {
+                    AuthorizeHost(parameters, ownerPid);
+                    return method == "host.native_surface.register"
+                        ? NativeSurfaceRegistry.Register(parameters, ownerPid)
+                        : NativeSurfaceRegistry.Unregister(parameters, ownerPid);
+                }
+            }
             if (method == "office.capture")
             {
                 Office office;
                 lock (sync) office = GetOffice(Wire.Text(parameters, "officeId"));
                 JsonNode? selection;
-                try { selection = await PipeClient.CallAsync(office.PipeName, "captureSelection", null, cancellation); }
+                try { selection = await PipeClient.CallOfficeAsync(office.PipeName, office.Pid, "captureSelection", null, cancellation); }
                 catch (Exception) { throw new CoreFault("office_capture_unavailable", "Office could not capture a selection. No reference was created."); }
                 lock (sync) return Metadata(Capture(selection));
             }
@@ -127,10 +158,6 @@ public sealed partial class CoreState : IAsyncDisposable
                 lock (sync) RememberOpenedSession(parameters, opened, ownerPid);
                 Office[] targets;
                 lock (sync) targets = offices.Values.Where(item => item.Pid == Wire.Number(opened, "pid")).ToArray();
-                // #region agent log
-                DebugNdjson.Probe("A", "CoreState.office.open", "opened_before_refresh",
-                    new { targets = targets.Length });
-                // #endregion
                 if (targets.Length > 0)
                 {
                     var refreshTargets = targets;
@@ -138,11 +165,12 @@ public sealed partial class CoreState : IAsyncDisposable
                     {
                         using var refreshDeadline = new CancellationTokenSource(TimeSpan.FromMilliseconds(2000));
                         foreach (var target in refreshTargets)
-                            try { await PipeClient.CallAsync(target.PipeName, "refreshDocumentBindings", OleDocumentHost.SourceBindingsForProcess(target.Pid), refreshDeadline.Token); } catch { }
+                            try { await PipeClient.CallOfficeAsync(target.PipeName, target.Pid, "refreshDocumentBindings", OleDocumentHost.SourceBindingsForProcess(target.Pid), refreshDeadline.Token); } catch { }
                     });
                 }
                 return opened;
             }
+            if (FocusContract.Methods.Contains(method)) return await InvokeFocusAsync(method, parameters, ownerPid, cancellation);
             if (method == "host.wait_delivery") return await WaitHostDeliveryAsync(parameters, ownerPid, cancellation);
             if (method == "routing.touch") return await TouchRouteAsync(parameters, ownerPid, cancellation);
             if (method == "routing.hook") return await HookActivityAsync(parameters, cancellation);
@@ -203,7 +231,7 @@ public sealed partial class CoreState : IAsyncDisposable
         version = RuntimeIdentity.Version,
         nativeHost = OleDocumentHost.Diagnostics,
         capabilities = new { nativeOfficeEmbedding = true, nativeAutoSaveLocalRedirect = false, documentWrite = true, documentWriteRequiresAdapterCapability = true, selectionCapture = true, mcpApps = true, tabUiDoesNotLocateContent = true, agentEditsUseMcp = true,
-            supportedWriteKinds = AllowedWriteKinds, manualSave = true, guardedRevert = true },
+            supportedWriteKinds = AllowedWriteKinds, manualSave = true, guardedRevert = true, focusHybrid = FocusHybridEnabled },
         appOrigin = AppOrigin,
         appPort = Uri.TryCreate(AppOrigin, UriKind.Absolute, out var appUri) ? appUri.Port : 0,
         owners = new { hosts = hosts.Count, office = offices.Count, chats = chats.Count, apps = chats.Values.Count(item => item.Connected), mcp = runtimeOwners.Count },
@@ -239,7 +267,13 @@ public sealed partial class CoreState : IAsyncDisposable
     private ProcessLease NewOwner(int ownerPid, Action cleanup)
     {
         if (ownerPid <= 0) throw new CoreFault("owner_unavailable", "A live process owner is required.");
-        return new ProcessLease(ownerPid, () => { lock (sync) { if (!disposed) cleanup(); } ScheduleIdleShutdown(); });
+        return new ProcessLease(ownerPid, () =>
+        {
+            CoreTrace.Mark("lease", "exited");
+            lock (sync) { if (!disposed) cleanup(); }
+            CoreTrace.Mark("lease", "cleaned");
+            ScheduleIdleShutdown();
+        });
     }
     private JsonNode? RegisterHost(JsonNode? value, int pid)
     {
@@ -259,10 +293,14 @@ public sealed partial class CoreState : IAsyncDisposable
     private void RemoveHost(string id, string? lease = null)
     {
         if (!hosts.TryGetValue(id, out var host) || lease is not null && host.Lease != lease) return;
+        CoreTrace.Mark("host", "remove");
         hosts.Remove(id);
         host.Deliveries.Writer.TryComplete();
         host.Owner.Dispose();
         foreach (var session in sessionOwners.Where(item => item.Value.HostId == id).ToArray()) ForgetSession(session.Key);
+        CoreTrace.Mark("host", "detach-focus");
+        DetachFocusHost(id);
+        CoreTrace.Mark("host", "detached-focus");
         foreach (var chat in chats.Values.Where(item => item.HostId == id).ToArray()) RemoveChat(chat.Id);
     }
     private void EnsureHostComposerChat(Host host, int pid)
@@ -616,11 +654,15 @@ public sealed partial class CoreState : IAsyncDisposable
         lock (sync)
         {
             if (disposed) return ValueTask.CompletedTask;
+            CoreTrace.Mark("dispose", "begin");
             disposed = true; idleTimer.Dispose();
             foreach (var value in hosts.Values) value.Owner.Dispose();
             foreach (var value in offices.Values) value.Owner.Dispose();
             foreach (var value in chats.Values) { value.Owner.Dispose(); value.Signals.Writer.TryComplete(); }
             foreach (var value in runtimeOwners.Values) value.Process.Dispose();
+            CoreTrace.Mark("dispose", "owners-released");
+            DisposeFocus();
+            CoreTrace.Mark("dispose", "end");
         }
         return ValueTask.CompletedTask;
     }

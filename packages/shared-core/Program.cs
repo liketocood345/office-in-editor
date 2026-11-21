@@ -10,6 +10,14 @@ public static class Program
 {
     public static int Main(string[] args)
     {
+        // #region agent log
+        AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+        {
+            var error = e.ExceptionObject as Exception;
+            DebugNdjson.Probe("J", "Program.Main", "unhandled",
+                new { type = error?.GetType().Name, term = e.IsTerminating });
+        };
+        // #endregion
         try
         {
             if (!OperatingSystem.IsWindows()) throw new CoreFault("unsupported_platform", "This private worker requires Windows.");
@@ -75,6 +83,7 @@ public static class Program
         await app.StartAsync(stop.Token);
         state.AppOrigin = app.Origin;
         state.BecameIdle += () => stop.Cancel();
+        state.StartDiagnostics();
         state.ScheduleIdleShutdown();
         using var clients = new SemaphoreSlim(16);
         var requests = new List<Task>();
@@ -94,8 +103,12 @@ public static class Program
         catch (OperationCanceledException) when (stop.IsCancellationRequested) { }
         finally
         {
+            // Stall watchdog: a shutdown that does not finish within 15 s is written to diagnostics.
+            Interlocked.CompareExchange(ref CoreTrace.ShutdownStartedAt, Environment.TickCount64, 0);
+            CoreTrace.Mark("shutdown", "accept-stopped");
             stop.Cancel();
             await Task.WhenAny(Task.WhenAll(requests), Task.Delay(TimeSpan.FromSeconds(3)));
+            CoreTrace.Mark("shutdown", "requests-drained");
         }
     }
 

@@ -9,7 +9,8 @@ $stableRoot = [IO.Path]::GetFullPath($InstallRoot).TrimEnd('\')
 if (-not $stableRoot.StartsWith($productRoot.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) {
     throw 'InstallRoot must be inside the current-user OfficeInEditor product directory.'
 }
-$expectedCodeBase = ([Uri](Join-Path $stableRoot 'office\OfficeInEditor.Addin.dll')).AbsoluteUri
+$addinUri = [Uri](Join-Path $stableRoot 'office\OfficeInEditor.Addin.dll')
+$expectedCodeBases = @($addinUri.ToString(),$addinUri.AbsoluteUri)
 $removals = 0
 foreach ($view in @([Microsoft.Win32.RegistryView]::Registry64, [Microsoft.Win32.RegistryView]::Registry32)) {
     $userRegistry = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::CurrentUser, $view)
@@ -21,7 +22,7 @@ foreach ($view in @([Microsoft.Win32.RegistryView]::Registry64, [Microsoft.Win32
         finally { $classKey.Dispose() }
         $server = $userRegistry.OpenSubKey($classPath + '\InprocServer32')
         if ($null -eq $server) { throw 'Incomplete COM registration requires explicit inspection; nothing was removed.' }
-        try { if ($server.GetValue('CodeBase') -ne $expectedCodeBase -or $server.GetValue('Class') -ne 'OfficeInEditor.OfficeAddin.OfficeAddin') {
+        try { if ($server.GetValue('CodeBase') -notin $expectedCodeBases -or $server.GetValue('Class') -ne 'OfficeInEditor.OfficeAddin.OfficeAddin') {
                 throw 'COM registration belongs to a different installation; nothing was removed.'
             } } finally { $server.Dispose() }
         $paths = @('Word', 'Excel', 'PowerPoint') | ForEach-Object { 'Software\Microsoft\Office\' + $_ + '\Addins\' + $addinProgId }

@@ -17,6 +17,7 @@ internal static class WriteTests
             operation = new { kind = "word.insert_text", args = new { offset = 0, text } } })!;
         JsonNode Key(string id, string document = "write-doc") => Wire.Node(new { officeId = "write-test-office", documentId = document, operationId = id })!;
         await Register(core);
+        await fault(async () => { await PipeClient.CallOfficeAsync(fake.PipeName, Environment.ProcessId + 1, "inspectDocument", null, CancellationToken.None); }, "office_peer_unverified");
         var inspected = await Call("office.inspect_document", Wire.Node(new { officeId = "write-test-office", documentId = "write-doc" }));
         check(inspected?["capabilities"]?["writeKinds"]?.AsArray().Count == 1, "write capability is provided by the Office adapter");
         var edit = await Call("office.apply_edit", Args("edit-one"));
@@ -94,7 +95,9 @@ internal static class WriteTests
                     try
                     {
                         await pipe.WaitForConnectionAsync(stop.Token);
-                        var request = JsonNode.Parse((await Wire.ReadLineAsync(pipe, stop.Token))!);
+                        var line = await Wire.ReadLineAsync(pipe, stop.Token);
+                        if (line is null) continue;
+                        var request = JsonNode.Parse(line);
                         var method = Wire.Text(request, "method"); var parameters = request?["params"];
                         var documentId = Wire.Text(parameters, "documentId", 160);
                         JsonNode? result;

@@ -18,7 +18,7 @@ public static class Program
     {
         try
         {
-            CheckRibbon(); CheckReadOnlyCapture(); CheckSecurity(); CheckWire(); CheckCancelledDispatch(); CheckCallback(); CheckEdits(); CheckWindowHost(); CheckLocalAutoSave(); CheckEmbeddedBindings(); CheckRouteCache();
+            CheckRibbon(); CheckReadOnlyCapture(); CheckSecurity(); CheckWire(); CheckCancelledDispatch(); CheckCallback(); CheckEdits(); CheckWindowHost(); CheckLocalAutoSave(); CheckEmbeddedBindings(); CheckRouteCache(); CheckFocusDocuments();
             Console.WriteLine("Office add-in smoke passed: " + assertions + " assertions; no Office activation or registration.");
             return 0;
         }
@@ -423,6 +423,50 @@ public static class Program
         Assert(!cache.Bind("doc-a", "session-a", "late", "Late", "late-epoch", 99, "broker-a"));
         Assert(cache.For("doc-a").Id == "restart");
     }
+    private static void CheckFocusDocuments()
+    {
+        string folder = Path.Combine(Path.GetTempPath(), "oie-focus-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(folder);
+        try
+        {
+            string first = Path.Combine(folder, "a.docx"), second = Path.Combine(folder, "b.docx");
+            File.WriteAllBytes(first, new byte[] { 1 }); File.WriteAllBytes(second, new byte[] { 2 });
+            var word = new FocusWord(new FocusWordDocument(first, 101), new FocusWordDocument(second, 202));
+            var registry = new SelectionCapture(word, "word", "focus-word").Documents;
+            var focus = new FocusDocuments(word, "word", registry, window => new IntPtr(window.ToInt64() + 1));
+            Assert(FocusDocuments.Handles("resolveDocumentWindow") && !FocusDocuments.Handles("inspectDocument"));
+            var found = Json.Map(focus.Dispatch("resolveDocumentWindow", Json.Object("path", second.ToUpperInvariant())));
+            Assert(Json.IsTrue(found["found"]) && Convert.ToInt64(found["hwnd"]) == 203 && !found.ContainsKey("path"));
+            string id = (string)found["documentId"];
+            Assert(!Json.IsTrue(Json.Get(focus.Dispatch("resolveDocumentWindow", Json.Object("path", Path.Combine(folder, "missing.docx"))), "found")));
+            Expect("INVALID_PATH", () => focus.Dispatch("resolveDocumentWindow", Json.Object("path", "relative.docx")));
+            Expect("INVALID_PATH", () => focus.Dispatch("resolveDocumentWindow", Json.Object("path", "\\\\server\\share\\a.docx")));
+            var rejected = new FocusDocuments(word, "word", registry, window => IntPtr.Zero);
+            Assert(Json.Text(rejected.Dispatch("resolveDocumentWindow", Json.Object("path", first)), "reason") == "window_unavailable");
+
+            Assert(!Json.IsTrue(Json.Get(focus.Dispatch("documentState", Json.Object("documentId", id)), "dirty")));
+            word.Docs[1].Saved = false;
+            Assert(Json.IsTrue(Json.Get(focus.Dispatch("documentState", Json.Object("documentId", id)), "dirty")));
+            Assert(Json.IsTrue(Json.Get(focus.Dispatch("closeDocument", Json.Object("documentId", id, "save", true)), "closed")));
+            Assert(word.Docs.Count == 1 && word.ClosedWith == -1);
+            Expect("DOCUMENT_CLOSED", () => focus.Dispatch("documentState", Json.Object("documentId", id)));
+            Expect("UNKNOWN_DOCUMENT", () => focus.Dispatch("closeDocument", Json.Object("documentId", "nope", "save", false)));
+
+            string deckPath = Path.Combine(folder, "c.pptx");
+            File.WriteAllBytes(deckPath, new byte[] { 3 });
+            var ppt = new FocusPowerPoint(new FocusDeck(deckPath));
+            var pptFocus = new FocusDocuments(ppt, "powerpoint", new SelectionCapture(ppt, "powerpoint", "focus-ppt").Documents,
+                window => window, caption => caption == "c.pptx" ? new IntPtr(77) : IntPtr.Zero);
+            var deck = Json.Map(pptFocus.Dispatch("resolveDocumentWindow", Json.Object("path", deckPath)));
+            Assert(Convert.ToInt64(deck["hwnd"]) == 77);
+            var closing = ppt.Decks[0];
+            closing.Saved = false; closing.SavedWritten = false;
+            pptFocus.Dispatch("closeDocument", Json.Object("documentId", (string)deck["documentId"], "save", false));
+            Assert(ppt.Decks.Count == 0 && ppt.SaveCalls == 0 && !closing.SavedWritten);
+            Assert(FocusDocuments.FileIdentity(first) == FocusDocuments.FileIdentity(first.ToUpperInvariant()) && FocusDocuments.FileIdentity(first) != null);
+        }
+        finally { try { Directory.Delete(folder, true); } catch { } }
+    }
     private static void Expect(string code, Action action)
     {
         try { action(); throw new Exception("Expected rejection"); }
@@ -718,3 +762,70 @@ public sealed class EditableShape
 }
 public sealed class EditableTextFrame { public EditableTextRange TextRange { get; } = new EditableTextRange(); }
 public sealed class EditableTextRange { public string Text { get; set; } }
+
+public sealed class FocusWord
+{
+    public List<FocusWordDocument> Docs { get; } = new List<FocusWordDocument>();
+    public FocusWordCollection Documents { get; }
+    public FocusWordDocument ActiveDocument => Docs.Count > 0 ? Docs[0] : null;
+    public int ClosedWith = int.MinValue;
+    public FocusWord(params FocusWordDocument[] documents)
+    {
+        foreach (var document in documents) { document.Owner = this; Docs.Add(document); }
+        Documents = new FocusWordCollection(this);
+    }
+}
+public sealed class FocusWordCollection
+{
+    private readonly FocusWord word;
+    public FocusWordCollection(FocusWord word) { this.word = word; }
+    public int Count => word.Docs.Count;
+    public FocusWordDocument Item(int index) => word.Docs[index - 1];
+}
+public sealed class FocusWordDocument
+{
+    public FocusWordDocument(string path, long hwnd) { FullName = path; ActiveWindow = new FocusHwnd(hwnd); }
+    public FocusWord Owner;
+    public string FullName { get; }
+    public string Name => System.IO.Path.GetFileName(FullName);
+    public bool Saved { get; set; } = true;
+    public FocusHwnd ActiveWindow { get; }
+    public void Close(int saveChanges) { Owner.ClosedWith = saveChanges; Owner.Docs.Remove(this); }
+}
+public sealed class FocusHwnd { public FocusHwnd(long hwnd) { Hwnd = hwnd; } public long Hwnd { get; } }
+public sealed class FocusPowerPoint
+{
+    public List<FocusDeck> Decks { get; } = new List<FocusDeck>();
+    public FocusDeckCollection Presentations { get; }
+    public FocusDeck ActivePresentation => Decks.Count > 0 ? Decks[0] : null;
+    public int SaveCalls;
+    public FocusPowerPoint(FocusDeck deck) { deck.Owner = this; Decks.Add(deck); Presentations = new FocusDeckCollection(this); }
+}
+public sealed class FocusDeckCollection
+{
+    private readonly FocusPowerPoint app;
+    public FocusDeckCollection(FocusPowerPoint app) { this.app = app; }
+    public int Count => app.Decks.Count;
+    public FocusDeck Item(int index) => app.Decks[index - 1];
+}
+public sealed class FocusDeck
+{
+    public FocusDeck(string path) { FullName = path; Windows = new FocusDeckWindows(System.IO.Path.GetFileName(path)); }
+    public FocusPowerPoint Owner;
+    public string FullName { get; }
+    public string Name => System.IO.Path.GetFileName(FullName);
+    private bool saved = true;
+    public bool Saved { get => saved; set { saved = value; SavedWritten = true; } }
+    public FocusDeckWindows Windows { get; }
+    public void Save() { Owner.SaveCalls++; Saved = true; }
+    public bool SavedWritten;
+    public void Close() { Owner.Decks.Remove(this); }   // PowerPoint closes without prompting or saving.
+}
+public sealed class FocusDeckWindows
+{
+    private readonly FocusDeckWindow window;
+    public FocusDeckWindows(string caption) { window = new FocusDeckWindow(caption); }
+    public FocusDeckWindow Item(int index) => window;
+}
+// Mirrors builds where DocumentWindow exposes no HWND: only Caption is available.
+public sealed class FocusDeckWindow { public FocusDeckWindow(string caption) { Caption = caption; } public string Caption { get; } }

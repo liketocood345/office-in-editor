@@ -39,6 +39,10 @@ public sealed partial class CoreState
         var id = Wire.Text(value, "sessionId", 64);
         if (!id.StartsWith("ole-", StringComparison.Ordinal) || !Guid.TryParseExact(id[4..], "N", out _))
             throw new CoreFault("invalid_session", "The editor session identity is invalid.");
+        var token = Wire.Text(value, "surfaceToken", 80, false);
+        NativeSurfaceRegistry.VerifyRequester(token, pid);
+        if (NativeSurfaceRegistry.IsRegistered(token) && token != "oie-surface-" + id[4..])
+            throw new CoreFault("invalid_native_surface", "The native slot must match the document session.");
         if (sessionOwners.ContainsKey(id)) throw new CoreFault("identity_conflict", "The session already has an owner.");
         if (sessionOwners.Count >= 64) throw new CoreFault("quota_exceeded", "The session ownership budget is full.");
         sessionOwners.Add(id, new SessionOwner(host.Id, host.Lease, host.Epoch, pid, 0));
@@ -76,6 +80,15 @@ public sealed partial class CoreState
             var host = AuthorizeHost(value, pid);
             if (host.Id != owner.HostId || host.Epoch != owner.Epoch || host.Lease != owner.Lease)
                 throw new CoreFault("unauthorized", "This session belongs to another host lease.");
+            if (method is "office.attach_window" or "office.layout_window")
+            {
+                var token = Wire.Text(value, "surfaceToken", 80, false);
+                var original = "oie-surface-" + id[4..];
+                NativeSurfaceRegistry.VerifyRequester(token, pid);
+                if (token.Length > 0 && token != original &&
+                    (NativeSurfaceRegistry.IsRegistered(original) || NativeSurfaceRegistry.IsRegistered(token)))
+                    throw new CoreFault("invalid_native_surface", "A live native slot cannot move to another tab.");
+            }
             return;
         }
         var documentId = Wire.Text(value, "documentId", 160);
@@ -199,7 +212,7 @@ public sealed partial class CoreState
         deadline.CancelAfter(TimeSpan.FromMilliseconds(500));
         try
         {
-            var answer = await PipeClient.CallAsync(office.PipeName, "bindChatTarget", Wire.Node(new { id = chat.Id, label = chat.Label, epoch = chat.Epoch,
+            var answer = await PipeClient.CallOfficeAsync(office.PipeName, office.Pid, "bindChatTarget", Wire.Node(new { id = chat.Id, label = chat.Label, epoch = chat.Epoch,
                 documentId = binding.DocumentId, sessionId = binding.SessionId, routeVersion = route.Version, brokerEpoch }), deadline.Token);
             pushed = Wire.Boolean(answer, "bound");
         }

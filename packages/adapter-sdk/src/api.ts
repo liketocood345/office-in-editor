@@ -2,6 +2,14 @@ import { randomUUID } from "node:crypto";
 import { OfficeBridgeError } from "./errors";
 import { isRecord } from "./protocol";
 import { OPEN_DOCUMENT_TIMEOUT_MS } from "./protocol";
+
+/** focus.open upper bound: Core resolves or fails within 25 s, so a focus tab never waits more than 30 s. */
+export const FOCUS_OPEN_TIMEOUT_MS = 30_000;
+import {
+  parseFocusCloseResult, parseFocusOpenResult, validateSurfaceSize,
+  type FocusActivateParams, type FocusCloseParams, type FocusCloseResult, type FocusLayoutParams,
+  type FocusOpenParams, type FocusOpenResult, type FocusState, type FocusStatus, type FocusWheelParams, type PixelPolicy,
+} from "./focus";
 import type {
   BrokerTransport, CoreHealth, DashboardSnapshot, DeliveryReceipt, HostLease,
   HostBounds, HostRegistration, OfficeInstance, OfficeReference, ReferenceMetadata, RegisteredChat,
@@ -37,6 +45,14 @@ export class OfficeBroker {
 
   registerHost(registration: HostRegistration): Promise<HostLease> {
     return this.transport.request("host.register", { ...registration });
+  }
+
+  registerNativeSurface(surfaceToken: string, slot: { hwnd: string; generation: string; pid: number }): Promise<unknown> {
+    return this.transport.request("host.native_surface.register", this.withHost({ surfaceToken, ...slot }));
+  }
+
+  releaseNativeSurface(surfaceToken: string): Promise<unknown> {
+    return this.transport.request("host.native_surface.release", this.withHost({ surfaceToken }), { ensureBroker: false });
   }
 
   unregisterHost(lease: HostLease): Promise<unknown> {
@@ -112,6 +128,40 @@ export class OfficeBroker {
 
   configureOfficeWindow(officeId: string, payload: { enabled?: boolean; seconds?: number; saveOnClose?: boolean; ackAlerts?: boolean }): Promise<{ ackAlerts?: boolean; saveOnClose?: boolean }> {
     return this.transport.request("office.configure_save_window", this.withHost({ officeId, ...payload }));
+  }
+
+  /** Opens (or joins) the focus-hybrid session for a file; frames and state arrive on the returned stream pipe. */
+  async openFocusSession(params: FocusOpenParams): Promise<FocusOpenResult> {
+    validateSurfaceSize(params);
+    // Core answers within 25 s even on a cold Office start; the tab never waits longer than 30 s.
+    const value = await this.transport.request<unknown>("focus.open", this.withHost({ ...params }), { timeoutMs: FOCUS_OPEN_TIMEOUT_MS });
+    return parseFocusOpenResult(value);
+  }
+
+  activateFocusSession(params: FocusActivateParams): Promise<{ state: FocusState; activationId: number }> {
+    return this.transport.request("focus.activate", this.withHost({ ...params }), { timeoutMs: 3_000 });
+  }
+
+  layoutFocusSession(params: FocusLayoutParams): Promise<{ state: FocusState }> {
+    validateSurfaceSize(params);
+    return this.transport.request("focus.layout", this.withHost({ ...params }), { ensureBroker: false, timeoutMs: 1_500 });
+  }
+
+  /** Wheel over a parked tab; false when Core did not forward it (not parked, hidden tab, or another tab is active). */
+  wheelFocusSession(params: FocusWheelParams): Promise<{ forwarded: boolean }> {
+    return this.transport.request("focus.wheel", this.withHost({ ...params }), { ensureBroker: false, timeoutMs: 1_000 });
+  }
+
+  setFocusPixelPolicy(sessionId: string, pixelPolicy: PixelPolicy): Promise<{ pixelPolicy: PixelPolicy }> {
+    return this.transport.request("focus.policy", this.withHost({ sessionId, pixelPolicy }));
+  }
+
+  async closeFocusSession(params: FocusCloseParams): Promise<FocusCloseResult> {
+    return parseFocusCloseResult(await this.transport.request<unknown>("focus.close", this.withHost({ ...params }), { timeoutMs: 20_000 }));
+  }
+
+  focusStatus(sessionId: string): Promise<FocusStatus> {
+    return this.transport.request("focus.status", this.withHost({ sessionId }), { ensureBroker: false });
   }
 
   async dashboard(): Promise<DashboardSnapshot> {

@@ -1,3 +1,4 @@
+using Microsoft.Win32.SafeHandles;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Pipes;
@@ -82,12 +83,24 @@ public static class RuntimeIdentity
 
 public static class PipeClient
 {
-    public static async Task<JsonNode?> CallAsync(string pipeName, string method, JsonNode? parameters, CancellationToken cancellation)
+    public static Task<JsonNode?> CallAsync(string pipeName, string method, JsonNode? parameters, CancellationToken cancellation) =>
+        RequestAsync(pipeName, null, method, parameters, cancellation);
+
+    public static Task<JsonNode?> CallOfficeAsync(string pipeName, int officePid, string method, JsonNode? parameters, CancellationToken cancellation) =>
+        RequestAsync(pipeName, officePid, method, parameters, cancellation);
+
+    private static async Task<JsonNode?> RequestAsync(string pipeName, int? officePid, string method, JsonNode? parameters, CancellationToken cancellation)
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
         timeout.CancelAfter(TimeSpan.FromSeconds(55));
-        await using var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
+        await using var pipe = officePid is null
+            ? new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly)
+            : new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous, TokenImpersonationLevel.Identification);
         await pipe.ConnectAsync(timeout.Token);
+        // The Framework add-in ACL uses the account SID. CurrentUserOnly uses the token's
+        // default owner SID on Windows, which can be the Administrators group instead.
+        if (officePid is int expected && !WindowsPipePeer.IsRegisteredOfficeServer(pipe, expected))
+            throw new CoreFault("office_peer_unverified", "The callback pipe does not belong to the registered Office process and account.");
         var id = Guid.NewGuid().ToString("N");
         await Wire.WriteAsync(pipe, new { v = 1, id, method, @params = parameters }, timeout.Token);
         var line = await Wire.ReadLineAsync(pipe, timeout.Token) ?? throw new CoreFault("connection_closed", "The worker closed the connection.");
@@ -130,6 +143,28 @@ public static class PipeClient
 
 internal static partial class WindowsPipePeer
 {
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool GetNamedPipeServerProcessId(SafePipeHandle pipe, out uint serverProcessId);
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    private static partial SafeProcessHandle OpenProcess(uint access, [MarshalAs(UnmanagedType.Bool)] bool inherit, uint processId);
+    [LibraryImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool OpenProcessToken(SafeProcessHandle process, uint access, out SafeAccessTokenHandle token);
+
+    internal static bool IsRegisteredOfficeServer(NamedPipeClientStream pipe, int expectedPid)
+    {
+        if (expectedPid <= 0 || !GetNamedPipeServerProcessId(pipe.SafePipeHandle, out var serverPid) || serverPid != expectedPid) return false;
+        const uint queryLimitedInformation = 0x1000;
+        const uint tokenQuery = 0x0008;
+        using var process = OpenProcess(queryLimitedInformation, false, serverPid);
+        if (process.IsInvalid || !OpenProcessToken(process, tokenQuery, out var token)) return false;
+        using (token)
+        using (var server = new WindowsIdentity(token.DangerousGetHandle()))
+        using (var caller = WindowsIdentity.GetCurrent())
+            return server.User is { } serverSid && caller.User is { } callerSid && serverSid.Equals(callerSid);
+    }
+
     [LibraryImport("kernel32.dll")]
     private static partial IntPtr GetStdHandle(int kind);
     [LibraryImport("kernel32.dll", SetLastError = true)]
@@ -178,7 +213,11 @@ public sealed class ProcessLease : IDisposable
     {
         if (Interlocked.Exchange(ref disposed, 1) != 0) return;
         process.Exited -= Exited;
-        process.Dispose();
+        // Process.Dispose takes the Process object's lock, which .NET holds while that process's Exited callback runs.
+        // Leases on one pid (a host and its chat) exit together: one cleanup holds the Core lock and disposes the other
+        // lease while that lease's callback holds its Process lock and waits for the Core lock, so a synchronous
+        // Dispose here deadlocked the whole broker. The disposed flag already stops onExit; release the handle later.
+        ThreadPool.UnsafeQueueUserWorkItem(static state => ((Process)state!).Dispose(), process);
     }
 }
 
@@ -194,30 +233,34 @@ internal static class DebugNdjson
         lock (Gate)
         {
             if (Events.Count == Capacity) Events.Dequeue();
-            Events.Enqueue(new { hypothesisId, location, message, timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() });
+            Events.Enqueue(new
+            {
+                hypothesisId = Stage(hypothesisId, 32),
+                location = Stage(location, 96),
+                message = Stage(message, 64),
+                timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+            });
         }
     }
 
     internal static object[] Snapshot() { lock (Gate) return Events.ToArray(); }
 
-    // #region agent log
+    // Stage names are bounded identifiers, not arbitrary text. Payloads are never
+    // inspected, formatted or retained; they may contain document content or paths.
+    private static string Stage(string? value, int maximum)
+    {
+        if (string.IsNullOrEmpty(value) || value.Length > maximum) return "invalid-stage";
+        foreach (var character in value)
+            if (!char.IsAsciiLetterOrDigit(character) && character is not ('.' or '_' or '-' or ':'))
+                return "invalid-stage";
+        return value;
+    }
+
+    // Keep legacy probes on the same explicit opt-in, bounded in-memory path.
+    // No event handler starts a file writer, background flush or network request.
     internal static void Probe(string hypothesisId, string location, string message, object? data)
     {
-        try
-        {
-            var line = System.Text.Json.JsonSerializer.Serialize(new
-            {
-                sessionId = "4dd893",
-                runId = "hygiene",
-                hypothesisId,
-                location,
-                message,
-                data,
-                timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
-            });
-            File.AppendAllText("h:" + Path.DirectorySeparatorChar + Path.Combine(".cursor", "debug-4dd893.log"), line + Environment.NewLine);
-        }
-        catch { }
+        try { Write(hypothesisId, location, message, data); }
+        catch { /* Diagnostics never disrupt a native callback or Office operation. */ }
     }
-    // #endregion
 }

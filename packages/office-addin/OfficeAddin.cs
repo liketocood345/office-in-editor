@@ -3,8 +3,10 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Win32;
 
 [assembly: ComVisible(false)]
 [assembly: System.Runtime.CompilerServices.InternalsVisibleTo("OfficeInEditor.Addin.Smoke")]
@@ -37,6 +39,8 @@ namespace OfficeInEditor.OfficeAddin
         private int busy;
         private volatile bool disconnected;
         private const int ConnectModeStartup = 1;
+        private const string CaptureSettingsKey = @"HKEY_CURRENT_USER\Software\OfficeInEditor\FocusHybrid";
+        private const string CapturePolicyValue = "PixelPolicy";
 
         public void OnConnection(object application, int connectMode, object addInInst, ref Array custom)
         {
@@ -84,6 +88,7 @@ namespace OfficeInEditor.OfficeAddin
             autoSave = new LocalAutoSave(application, applicationKind, dispatcher, text => { status = text; Invalidate(); }, documents: selection.Documents);
             autoSave.Configure(true, 60);
             var operations = new DocumentOperations(application, applicationKind, selection.Documents);
+            var focus = new FocusDocuments(application, applicationKind, selection.Documents);
             pipeName = "office-in-editor-office-" + Process.GetCurrentProcess().Id + "-" + instanceId;
             callback = new OfficeCallbackServer(pipeName, dispatcher, (method, parameters) =>
             {
@@ -99,6 +104,7 @@ namespace OfficeInEditor.OfficeAddin
                     }
                     BeginRefreshDocumentBindings(); return Json.Object("refreshing", true);
                 }
+                if (FocusDocuments.Handles(method)) return focus.Dispatch(method, parameters);
                 if (method == "describeWindow") return windows.DescribeWindow(application);
                 if (method == "attachWindow") return windows.Attach(parameters, application);
                 if (method == "layoutWindow") return windows.Layout(parameters, application);
@@ -133,6 +139,35 @@ namespace OfficeInEditor.OfficeAddin
         public bool GetSaveOnClose(object control) => ActiveBinding()?.SaveOnClose ?? true;
         public bool GetAckAlerts(object control) => ActiveBinding()?.AckAlerts ?? true;
         public string GetSaveInterval(object control) => (ActiveBinding()?.Seconds ?? autoSave?.Seconds ?? 60).ToString();
+
+        public string GetCapturePolicy(object control)
+        {
+            try
+            {
+                switch (Registry.GetValue(CaptureSettingsKey, CapturePolicyValue, 1))
+                {
+                    case 0: return "OieCaptureOnSwitch";
+                    case 2: return "OieCaptureOnMouse";
+                }
+            }
+            catch { }
+            return "OieCaptureAlways";
+        }
+
+        public void SetCapturePolicy(object control, string selectedId, int selectedIndex)
+        {
+            int policy;
+            switch (selectedId)
+            {
+                case "OieCaptureOnSwitch": policy = 0; break;
+                case "OieCaptureAlways": policy = 1; break;
+                case "OieCaptureOnMouse": policy = 2; break;
+                default: return;
+            }
+            try { Registry.SetValue(CaptureSettingsKey, CapturePolicyValue, policy, RegistryValueKind.DWord); }
+            catch { return; }
+            Invalidate();
+        }
         public void SetSaveOnClose(object control, bool enabled)
         {
             var binding = ActiveBinding();

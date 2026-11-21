@@ -152,6 +152,76 @@ internal static class NativeOwnerTrackerTests
         windows.MoveOwner(windows.OwnerBounds.X + 25, windows.OwnerBounds.Y + 25);
         windows.Flush();
         check(windows.PopupBounds == detached, "disposed tracking cannot move the former popup");
+        RunChildNative(check);
+        RunAdoptionNative(check);
+    }
+
+    private static void RunAdoptionNative(Action<bool, string> check)
+    {
+        using var windows = new SyntheticWindows();
+        var before = windows.PopupDescription;
+        check(before.Popup && !before.Child, "adoption fixture begins as an owned popup rather than an existing child");
+        var attached = windows.AdoptPopup();
+        check(attached.Child && !attached.Popup && attached.IsChildOfOwner && attached.Parent == windows.Owner.ToInt64(),
+            "AdoptChild converts only the synthetic Core-owned popup into a verified WS_CHILD under its owner");
+        check(windows.RejectedAdoptionPreservesWindows(windows.Popup, windows.Popup),
+            "AdoptChild rejects self-parenting without changing either synthetic window");
+        check(windows.RejectedAdoptionPreservesWindows(IntPtr.Zero, windows.Owner)
+            && windows.RejectedAdoptionPreservesWindows(windows.Popup, IntPtr.Zero),
+            "AdoptChild rejects zero child or parent handles without changing the live synthetic windows");
+        check(windows.RejectedAdoptionPreservesWindows(windows.Owner, windows.Popup),
+            "AdoptChild rejects a real parent-child cycle before mutating either synthetic window");
+    }
+
+    private static void RunChildNative(Action<bool, string> check)
+    {
+        var before = NativeOwnerTracker.ActiveTrackerCount;
+        using var windows = new SyntheticWindows(child: true);
+        var owner = windows.OwnerBounds;
+        var client = windows.OwnerClientBounds;
+        var child = windows.PopupClientBounds;
+        var screen = windows.PopupBounds;
+        var invalidations = 0;
+        var finals = 0;
+        var tracker = NativeOwnerTracker.Create(windows.Owner, windows.Popup, final => {
+            Interlocked.Increment(ref invalidations);
+            if (final) Interlocked.Increment(ref finals);
+        });
+        try
+        {
+            tracker.Update(client, child, true);
+            windows.RaiseSibling();
+            check(windows.SiblingAbove, "synthetic child fixture has a sibling surface above the hosted child");
+            windows.MoveOwner(owner.X + 75, owner.Y + 43);
+            windows.EmitMoveEnd();
+            check(Eventually(() => Volatile.Read(ref finals) > 0
+                && windows.PopupBounds == new NativeOwnerTracker.Bounds(screen.X + 75, screen.Y + 43, screen.Width, screen.Height))
+                && windows.PopupClientBounds == child && windows.SiblingAbove,
+                "a real WS_CHILD follows its parent move without changing client coordinates or raising above a sibling");
+
+            tracker.Update(client, child, false);
+            check(Eventually(() => !windows.PopupVisible), "a hosted child honors tab hide");
+            windows.RaiseSibling();
+            tracker.Update(client, child, true);
+            check(Eventually(() => windows.PopupVisible) && windows.SiblingAbove,
+                "showing a calibrated hosted child preserves the existing sibling Z order");
+
+            var beforeResize = Volatile.Read(ref invalidations);
+            var beforeResizeFinal = Volatile.Read(ref finals);
+            windows.ResizeOwner(owner.Width + 50, owner.Height + 30);
+            check(Eventually(() => !windows.PopupVisible && Volatile.Read(ref invalidations) > beforeResize),
+                "a child-host client resize hides its stale rectangle and requests deferred calibration");
+            windows.EmitMoveEnd();
+            check(Eventually(() => Volatile.Read(ref finals) > beforeResizeFinal) && StaysHidden(windows),
+                "resize completion requests final child calibration without showing an invalid anchor");
+            tracker.Update(windows.OwnerClientBounds, child, true);
+            check(Eventually(() => windows.PopupVisible) && windows.SiblingAbove,
+                "a fresh child anchor restores visibility without stealing the sibling surface's Z order");
+        }
+        finally { tracker.Dispose(); }
+        check(Eventually(() => NativeOwnerTracker.ActiveTrackerCount == before
+            && (before != 0 || !NativeOwnerTracker.EventThreadRunning)),
+            "disposing the synthetic child tracker releases its native event resources");
     }
 
     private static bool Eventually(Func<bool> condition)
@@ -186,17 +256,32 @@ internal static class NativeOwnerTrackerTests
         private readonly TaskCompletionSource ready = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly Thread thread;
         private readonly WindowProc windowProc = DefWindowProc;
+        private readonly bool child;
         private uint threadId;
         private string className = "";
         private bool disposed;
         internal IntPtr Owner { get; private set; }
         internal IntPtr Popup { get; private set; }
+        private IntPtr sibling;
         internal NativeOwnerTracker.Bounds OwnerBounds => Invoke(() => ReadBounds(Owner));
+        internal NativeOwnerTracker.Bounds OwnerClientBounds => Invoke(() => {
+            if (!GetClientRect(Owner, out var rect)) throw new InvalidOperationException("Synthetic owner client is unavailable.");
+            return new NativeOwnerTracker.Bounds(0, 0, rect.Right - rect.Left, rect.Bottom - rect.Top);
+        });
         internal NativeOwnerTracker.Bounds PopupBounds => Invoke(() => ReadBounds(Popup));
+        internal NativeOwnerTracker.Bounds PopupClientBounds => Invoke(() => {
+            var screen = ReadBounds(Popup);
+            var origin = new Point { X = screen.X, Y = screen.Y };
+            if (!ScreenToClient(Owner, ref origin)) throw new InvalidOperationException("Synthetic child coordinates are unavailable.");
+            return new NativeOwnerTracker.Bounds(origin.X, origin.Y, screen.Width, screen.Height);
+        });
         internal bool PopupVisible => Invoke(() => IsWindowVisible(Popup));
+        internal bool SiblingAbove => Invoke(() => sibling != IntPtr.Zero && GetWindow(Owner, 5 /* GW_CHILD */) == sibling);
+        internal NativeWindow.HostDesc PopupDescription => Invoke(() => NativeWindow.DescribeHost(Popup, Owner));
 
-        internal SyntheticWindows()
+        internal SyntheticWindows(bool child = false)
         {
+            this.child = child;
             thread = new Thread(Run) { IsBackground = true, Name = "OieSyntheticOwnerTests" };
             thread.SetApartmentState(ApartmentState.STA);
             thread.Start();
@@ -213,9 +298,16 @@ internal static class NativeOwnerTrackerTests
                 var cls = new WindowClass { Size = (uint)Marshal.SizeOf<WindowClass>(), Proc = windowProc, Instance = GetModuleHandle(null), Name = className };
                 if (RegisterClassEx(ref cls) == 0) throw new InvalidOperationException("Synthetic window class registration failed.");
                 Owner = CreateWindowEx(0x08000000, className, "Synthetic owner", 0x00CF0000, 100, 100, 640, 480, IntPtr.Zero, IntPtr.Zero, cls.Instance, IntPtr.Zero);
-                Popup = CreateWindowEx(0x08000080, className, "Synthetic popup", 0x80000000, 180, 190, 400, 300, Owner, IntPtr.Zero, cls.Instance, IntPtr.Zero);
+                Popup = CreateWindowEx(0x08000080, className, "Synthetic popup", child ? 0x40000000u : 0x80000000u,
+                    child ? 80 : 180, child ? 90 : 190, 400, 300, Owner, IntPtr.Zero, cls.Instance, IntPtr.Zero);
                 if (Owner == IntPtr.Zero || Popup == IntPtr.Zero) throw new InvalidOperationException("Synthetic windows could not be created.");
                 ShowWindow(Owner, 4); ShowWindow(Popup, 4);
+                if (child)
+                {
+                    sibling = CreateWindowEx(0x08000000, className, "Synthetic sibling surface", 0x50000000,
+                        80, 90, 400, 300, Owner, IntPtr.Zero, cls.Instance, IntPtr.Zero);
+                    if (sibling == IntPtr.Zero) throw new InvalidOperationException("Synthetic sibling could not be created.");
+                }
                 ready.TrySetResult();
                 while (GetMessage(out var message, IntPtr.Zero, 0, 0) > 0)
                 {
@@ -229,6 +321,7 @@ internal static class NativeOwnerTrackerTests
             catch (Exception error) { ready.TrySetException(error); }
             finally
             {
+                if (sibling != IntPtr.Zero) DestroyWindow(sibling);
                 if (Popup != IntPtr.Zero) DestroyWindow(Popup);
                 if (Owner != IntPtr.Zero) DestroyWindow(Owner);
                 if (className.Length > 0) UnregisterClass(className, GetModuleHandle(null));
@@ -248,6 +341,24 @@ internal static class NativeOwnerTrackerTests
         internal void PlacePopup(NativeOwnerTracker.Bounds bounds) => Invoke(() => SetWindowPos(Popup, IntPtr.Zero, bounds.X, bounds.Y, bounds.Width, bounds.Height, SwpNoZOrder | SwpNoActivate));
         internal void MinimizeOwner() => Invoke(() => ShowWindow(Owner, 6));
         internal void RestoreOwner() => Invoke(() => ShowWindow(Owner, 4));
+        internal void RaiseSibling() => Invoke(() => SetWindowPos(sibling, IntPtr.Zero, 0, 0, 0, 0,
+            0x0001 | 0x0002 | SwpNoActivate));
+        internal NativeWindow.HostDesc AdoptPopup() => Invoke(() => {
+            NativeWindow.AdoptChild(Popup, Owner);
+            return NativeWindow.DescribeHost(Popup, Owner);
+        });
+        internal bool RejectedAdoptionPreservesWindows(IntPtr target, IntPtr parent) => Invoke(() => {
+            var ownerDescription = NativeWindow.DescribeHost(Owner, IntPtr.Zero);
+            var popupDescription = NativeWindow.DescribeHost(Popup, Owner);
+            var ownerBounds = ReadBounds(Owner);
+            var popupBounds = ReadBounds(Popup);
+            var rejected = false;
+            try { NativeWindow.AdoptChild(target, parent); }
+            catch (InvalidOperationException) { rejected = true; }
+            return rejected && ownerDescription == NativeWindow.DescribeHost(Owner, IntPtr.Zero)
+                && popupDescription == NativeWindow.DescribeHost(Popup, Owner)
+                && ownerBounds == ReadBounds(Owner) && popupBounds == ReadBounds(Popup);
+        });
         // Deliver the synthetic terminal event through User32 on the actual
         // owner's thread; this exercises the WinEvent hook and strict TID filter.
         internal void EmitMoveEnd() => Invoke(() => { NotifyWinEvent(0x000B, Owner, 0, 0); return true; });
@@ -284,6 +395,8 @@ internal static class NativeOwnerTrackerTests
     private struct Message { internal IntPtr Window; internal uint Id; internal UIntPtr WParam; internal IntPtr LParam; internal uint Time; internal int X, Y; internal uint Private; }
     [StructLayout(LayoutKind.Sequential)]
     private struct Rect { internal int Left, Top, Right, Bottom; }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Point { internal int X, Y; }
     [DllImport("kernel32.dll")] private static extern uint GetCurrentThreadId();
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] private static extern IntPtr GetModuleHandle(string? module);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern ushort RegisterClassEx(ref WindowClass windowClass);
@@ -293,6 +406,9 @@ internal static class NativeOwnerTrackerTests
     [DllImport("user32.dll")] private static extern bool ShowWindow(IntPtr window, int command);
     [DllImport("user32.dll")] private static extern bool SetWindowPos(IntPtr window, IntPtr after, int x, int y, int width, int height, uint flags);
     [DllImport("user32.dll")] private static extern bool GetWindowRect(IntPtr window, out Rect rect);
+    [DllImport("user32.dll")] private static extern bool GetClientRect(IntPtr window, out Rect rect);
+    [DllImport("user32.dll")] private static extern bool ScreenToClient(IntPtr window, ref Point point);
+    [DllImport("user32.dll")] private static extern IntPtr GetWindow(IntPtr window, uint command);
     [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr window);
     [DllImport("user32.dll")] private static extern void NotifyWinEvent(uint eventType, IntPtr window, int objectId, int childId);
     [DllImport("user32.dll")] private static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);

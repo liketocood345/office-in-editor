@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>本地 Word 编辑实验</title>
+<link rel="stylesheet" href="/style.css">
+<script defer src="/app.js"></script>
+<main>
+  <h1>synthetic.docx</h1>
+  <form id="editor">
+    <label for="text">正文</label>
+    <textarea id="text" maxlength="4096" spellcheck="false" disabled></textarea>
+    <div class="actions">
+      <button id="save" disabled>保存到本地文件</button>
+      <button id="end" type="button" disabled>结束实验</button>
+    </div>
+  </form>
+  <output id="status" aria-live="polite">连接本机 Word…</output>
+</main>
+</html>

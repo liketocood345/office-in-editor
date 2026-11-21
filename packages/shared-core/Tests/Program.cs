@@ -7,6 +7,18 @@ using System.Text;
 using System.Text.Json.Nodes;
 using OfficeInEditor.Core;
 
+if (args.Contains("--browser-office-probe", StringComparer.Ordinal))
+{
+    Environment.ExitCode = await BrowserOfficeProbe.RunAsync();
+    return;
+}
+
+if (args.FirstOrDefault() == "--office-windowless-probe")
+{
+    Environment.ExitCode = args.Length == 2 ? OfficeWindowlessProbe.Run(args[1]) : 2;
+    return;
+}
+
 var testId = Guid.NewGuid().ToString("N");
 var testRoot = Path.Combine(Path.GetTempPath(), "OfficeInEditor-tests-" + testId);
 var passed = 0;
@@ -47,6 +59,11 @@ try
     Check(!WebviewSurface.IsEditorWebview(IntPtr.Zero) && !WebviewSurface.IsTightEditorHost(new WebviewSurface.Placement(IntPtr.Zero, 214, 102, 860, 916, "uia-mapped")), "workbench-sized mapped parents are not a tight editor webview");
     Check(WebviewSurface.TryBounds(new double[] { 10, 20, 400, 300 }, out var bx, out var by, out var bw, out var bh) && bx == 10 && by == 20 && bw == 400 && bh == 300, "uia bounds arrays are left,top,width,height");
     SurfaceGeometryTests.Run(Check);
+    FocusContractTests.Run(Check);
+    FocusStateMachineTests.Run(Check);
+    FocusCaptureHostTests.Run(Check);
+    StallWatchdogTests.Run(Check);
+    ProcessLeaseTests.Run(Check);
     NativeOwnerTrackerTests.Run(Check);
     if (args.Contains("--native-owner-smoke", StringComparer.Ordinal)) NativeOwnerTrackerTests.RunNative(Check);
     var uia = UiaCom.Create();
@@ -68,6 +85,30 @@ try
     Check((await Call("host.list"))?.AsArray().Count == 1, "host registration");
     Check((await Call("chat.defaultTarget"))?["hostId"]?.GetValue<string>() == "test-host", "host register exposes a composer chat");
     await Fault(async () => { await Call("host.unregister", Wire.Node(new { hostId = "test-host", lease = "wrong" })); }, "unauthorized");
+    {
+        Check(health?["capabilities"]?["focusHybrid"]?.GetValue<bool>() == CoreState.FocusHybridEnabled, "health advertises focusHybrid only when enabled");
+        var focusSurface = "oie-surface-" + new string('d', 32);
+        var focusSession = new string('e', 32);
+        JsonNode FocusParams(object extra, bool authorized = true)
+        {
+            var value = Wire.Node(extra)!.AsObject();
+            value["hostId"] = "test-host";
+            value["hostLease"] = authorized ? host!["lease"]!.DeepClone() : new string('0', 64);
+            value["hostEpoch"] = host!["epoch"]!.DeepClone();
+            return value;
+        }
+        var activation = new { sessionId = focusSession, surfaceToken = focusSurface, activationId = 1, trusted = true };
+        await Fault(() => Call("focus.activate", FocusParams(activation, authorized: false)), "unauthorized");
+        await Fault(() => Call("focus.activate", FocusParams(activation)), "focus_session_not_found");
+        await Fault(() => Call("focus.status", FocusParams(new { sessionId = focusSession })), "focus_session_not_found");
+        await Fault(() => Call("focus.open", FocusParams(new { path = "relative.docx", surfaceToken = focusSurface, editorPid = 1, cssWidth = 800, cssHeight = 600, pixelRatio = 1 })), "invalid_path");
+        var focusFile = Path.Combine(testRoot, "focus-identity.docx");
+        Directory.CreateDirectory(testRoot);
+        File.WriteAllBytes(focusFile, [1, 2, 3]);
+        Check(CoreState.FileIdentity(focusFile) == CoreState.FileIdentity(focusFile.ToUpperInvariant()) && CoreState.FileIdentity(focusFile).StartsWith("id:", StringComparison.Ordinal),
+            "focus sessions are keyed by file identity, not spelling");
+        File.Delete(focusFile);
+    }
     var target = await Call("chat.register", Wire.Node(new { ownerId = "test-owner", hostId = "test-host", label = "Test chat" }));
     var targetId = target!["id"]!.GetValue<string>(); var token = target["token"]!.GetValue<string>();
     Check(!(await Call("chat.list"))!.ToJsonString().Contains(token, StringComparison.Ordinal), "chat directory never returns tokens");

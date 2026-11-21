@@ -5,6 +5,8 @@ const root = process.cwd();
 const required = [
   'payload/core/OfficeInEditor.Core.exe',
   'payload/core/mcp-app.html',
+  // Focus-hybrid capture helper; Core advertises focusHybrid only when it sits next to Core.
+  'payload/core/oie-focus-capture.exe',
   'payload/office/OfficeInEditor.Addin.dll',
   'payload/LICENSE',
   'payload/THIRD_PARTY_LICENSES.md'

@@ -146,11 +146,15 @@ namespace OfficeInEditor.OfficeAddin
         private const uint ThreadSetContext = 0x0010;
         private readonly Dictionary<int, Action> pending = new Dictionary<int, Action>();
         private readonly int threadId;
+        private readonly uint nativeThreadId;
         private readonly IntPtr threadHandle;
         private static readonly ApcCallback apc = ExecuteApc;
+        private static readonly TimerCallback timerCallback = ExecuteTimer;
         private static readonly Dictionary<int, OfficeDispatcher> owners = new Dictionary<int, OfficeDispatcher>();
+        private static readonly Dictionary<(uint, UIntPtr), OfficeDispatcher> timers = new Dictionary<(uint, UIntPtr), OfficeDispatcher>();
         private static int nextOwner;
         private readonly int ownerToken;
+        private readonly UIntPtr timer;
         private bool wakeQueued;
         internal int PendingCount { get { lock (pending) return pending.Count; } }
         private int next;
@@ -160,10 +164,17 @@ namespace OfficeInEditor.OfficeAddin
             threadId = Thread.CurrentThread.ManagedThreadId;
             if (Thread.CurrentThread.GetApartmentState() != ApartmentState.STA)
                 throw new BridgeException("OFFICE_STA_REQUIRED");
-            threadHandle = OpenThread(ThreadSetContext, false, GetCurrentThreadId());
+            nativeThreadId = GetCurrentThreadId();
+            threadHandle = OpenThread(ThreadSetContext, false, nativeThreadId);
             if (threadHandle == IntPtr.Zero) throw new BridgeException("OFFICE_STA_REQUIRED");
             ownerToken = Interlocked.Increment(ref nextOwner);
-            lock (owners) owners[ownerToken] = this;
+            // An idle Office STA can pump window messages without making an alertable wait.
+            timer = SetTimer(IntPtr.Zero, UIntPtr.Zero, 250, timerCallback);
+            lock (owners)
+            {
+                owners[ownerToken] = this;
+                if (timer != UIntPtr.Zero) timers[(nativeThreadId, timer)] = this;
+            }
         }
         internal void Execute(int token)
         {
@@ -179,9 +190,26 @@ namespace OfficeInEditor.OfficeAddin
         {
             OfficeDispatcher owner;
             lock (owners) if (!owners.TryGetValue(unchecked((int)token.ToUInt32()), out owner)) return;
+            owner.Drain();
+        }
+        private static void ExecuteTimer(IntPtr window, uint message, UIntPtr timerId, uint time)
+        {
+            OfficeDispatcher owner;
+            lock (owners) timers.TryGetValue((GetCurrentThreadId(), timerId), out owner);
+            if (owner == null) KillTimer(IntPtr.Zero, timerId);
+            else owner.Drain();
+        }
+        private void Drain()
+        {
             int[] work;
-            lock (owner.pending) { work = new int[owner.pending.Count]; owner.pending.Keys.CopyTo(work, 0); owner.wakeQueued = false; }
-            foreach (int item in work) try { owner.Execute(item); } catch { }
+            lock (pending)
+            {
+                wakeQueued = false;
+                if (pending.Count == 0) return;
+                work = new int[pending.Count];
+                pending.Keys.CopyTo(work, 0);
+            }
+            foreach (int item in work) try { Execute(item); } catch { }
         }
         internal async Task<T> InvokeAsync<T>(Func<T> callback, CancellationToken cancel)
         {
@@ -218,7 +246,12 @@ namespace OfficeInEditor.OfficeAddin
         {
             if (disposed) return;
             disposed = true;
-            lock (owners) owners.Remove(ownerToken);
+            lock (owners)
+            {
+                owners.Remove(ownerToken);
+                timers.Remove((nativeThreadId, timer));
+            }
+            if (timer != UIntPtr.Zero && GetCurrentThreadId() == nativeThreadId) KillTimer(IntPtr.Zero, timer);
             if (threadHandle != IntPtr.Zero) try { CloseHandle(threadHandle); } catch { }
             List<Action> abandoned;
             lock (pending) { abandoned = new List<Action>(pending.Values); pending.Clear(); }
@@ -227,6 +260,12 @@ namespace OfficeInEditor.OfficeAddin
 
         [UnmanagedFunctionPointer(CallingConvention.StdCall)]
         private delegate void ApcCallback(UIntPtr parameter);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        private delegate void TimerCallback(IntPtr window, uint message, UIntPtr timer, uint time);
+        [DllImport("user32.dll")]
+        private static extern UIntPtr SetTimer(IntPtr window, UIntPtr timer, uint milliseconds, TimerCallback callback);
+        [DllImport("user32.dll")]
+        private static extern bool KillTimer(IntPtr window, UIntPtr timer);
         [DllImport("kernel32.dll")]
         private static extern uint GetCurrentThreadId();
         [DllImport("kernel32.dll", SetLastError = true)]

@@ -25,9 +25,9 @@ internal static class OfficeDialogAck
     private static readonly Dictionary<string, int> Names = new(StringComparer.OrdinalIgnoreCase);
     private static readonly HashSet<uint> Watches = [];
     private static readonly ConcurrentDictionary<long, byte> Clicked = new();
+    private static readonly ConcurrentDictionary<uint, Process> WatchedProcesses = new();
     private static int enabled = 1;
     private static long lastPulse;
-    private static int pulseScans;
 
     internal static bool Enabled
     {
@@ -49,6 +49,22 @@ internal static class OfficeDialogAck
     {
         if (pid == 0 || !allow || !Enabled) return;
         lock (Gate) Watches.Add(pid);
+        // #region agent log
+        try
+        {
+            if (WatchedProcesses.ContainsKey(pid)) return;
+            var process = Process.GetProcessById((int)pid);
+            process.EnableRaisingEvents = true;
+            process.Exited += (_, _) =>
+            {
+                var code = -1;
+                try { code = process.ExitCode; } catch { }
+                DebugNdjson.Probe("J", "OfficeDialogAck.Watch", "server_exited", new { pid, code });
+            };
+            if (!WatchedProcesses.TryAdd(pid, process)) process.Dispose();
+        }
+        catch { }
+        // #endregion
     }
 
     internal static void Unwatch(uint pid)
@@ -108,10 +124,9 @@ internal static class OfficeDialogAck
         GC.KeepAlive(callback);
         if (clicked > 0) NativeWindow.PumpWait(30);
         // #region agent log
-        var scans = Interlocked.Increment(ref pulseScans);
-        if (origin != "pending" || clicked > 0 || scans <= 3)
-            DebugNdjson.Probe("B", "OfficeDialogAck.Pulse", clicked > 0 ? "clicked" : "scan",
-                new { origin, pids = pids.Count, seen, clicked, scans });
+        if (clicked > 0)
+            DebugNdjson.Probe("B", "OfficeDialogAck.Pulse", "clicked",
+                new { origin, pids = pids.Count, seen, clicked });
         // #endregion
     }
 

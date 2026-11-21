@@ -6,7 +6,7 @@
 
 若“小窗”指 Office 的 OLE/DocObject 原位视图，官方已经提供文档服务器这一侧，但容器仍要实现每个文档/视图的 site、UI 激活、边界空间、菜单、保存与释放。VS Code Custom Editor 对扩展公开的是 Webview 和文档生命周期，没有在该 API 中提供原生 HWND 安装槽。因此“Word 能在自建原生窗口编辑”只证明 Office 一侧，未证明能安全作为 IDE 标签。[IOleDocumentSite](https://learn.microsoft.com/en-us/windows/win32/api/docobj/nn-docobj-ioledocumentsite)、[Custom Editor API](https://code.visualstudio.com/api/extension-guides/custom-editors)
 
-**当前嵌套（DESIGN 已改口）：** OleSite.CreateWindow 创建 owned `WS_POPUP`，Place 调用 NativeWindow.OwnPopup。这是输入隔离下的嵌套（跨进程 `WS_CHILD` 进 Chromium 会把键鼠并入 IDE），不是按 `screenX/Y` 乱摆的独立工具窗。几何必须等于 `#ole-root` 令牌并集；铺满 IDE 或挡住侧栏即缺陷。不能沿用“已经作为 Webview WS_CHILD”的描述，也不再把 owned popup 本身当成违约。
+**当前嵌套（原位 OLE 路线，DESIGN 已改口）：** OleSite 先创建隐藏 HWND，Place 把 **自己的容器** `SetParent` 进承载该 Webview 的 IDE 顶层窗口 `Chrome_WidgetWin_1`（`WS_CHILD`，客户区坐标）。Webview 没有独立 HWND，所以父窗口只能是它。禁止 owned popup 薄壳、禁止 `SetWindowRgn` 挖洞、禁止整窗隐藏避让。几何必须等于 `#ole-root` 令牌并集；铺满 IDE 或挡住侧栏即缺陷。禁止 `SetParent` Office 主框，禁止挂进 `Chrome_RenderWidgetHostHWND`，也禁止按根窗口尺寸铺满。这些条款不约束焦点混合实验。
 
 这条路线必须自行同步遮挡、可见性、标签切换、焦点、屏幕坐标与 DPI，天然比真正父子窗口多一套状态；同时仍未落实 OLE SetBorderSpace/active object/ResizeBorder，Word 顶部遮挡缺口没有被 popup 改造解决。官方接口需要完整宿主实现，不能仅返回成功；也不能把项目自身漏接归因于 Office 不支持。
 

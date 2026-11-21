@@ -40,6 +40,15 @@ internal static class SurfaceGeometryTests
         check(WebviewSurface.ShiftedTowardOwnerOrigin(owner, rectangle, new(owner.X + 8, owner.Y + 8, 1200, 900))
             && !WebviewSurface.ShiftedTowardOwnerOrigin(owner, rectangle, new(rectangle.X, rectangle.Y, 1100, 900)),
             "a tab-reveal beacon union that walks toward the IDE origin is rejected; a same-origin shrink is not");
+        var client = WebviewSurface.ClientOrigin(860, 916);
+        WebviewSurface.ReadOwnerInsets(client, new(0, 0, 860, 916), out var cx, out var cy, out var cr, out var cb);
+        check(cx == 0 && cy == 0 && cr == 0 && cb == 0
+            && WebviewSurface.ApplyOwnerInsets(WebviewSurface.ClientOrigin(800, 900), 0, 0, 0, 0)
+                == new WebviewSurface.ScreenBounds(0, 0, 800, 900),
+            "child-hosted follow uses client origin insets, not screen overlay coordinates");
+        check(WebviewSurface.IsTightSlot(0, 0, 966, 916, 966, 916)
+            && !WebviewSurface.IsTightSlot(214, 102, 966, 916, 1920, 1080),
+            "a workbench GPU surface offset is not a tight editor container");
         check(WebviewSurface.PhysicalFromCss(1107, 1) == 1107 && WebviewSurface.PhysicalFromCss(800, 1.5) == 1200,
             "CSS idle mapping uses the reported pixel ratio");
         check(WebviewSurface.TryCssIdleNested(new(0, 0, 1935, 1056), 222, 110, 807, 853, 1, out var cssIdle)
@@ -59,14 +68,25 @@ internal static class SurfaceGeometryTests
         AppContext.SetSwitch("OfficeInEditor.Diagnostics", false);
         var before = DebugNdjson.Snapshot().Length;
         DebugNdjson.Write("test", "test", "disabled", new { secret = "document content" });
-        check(DebugNdjson.Snapshot().Length == before, "diagnostics have no default recording side effects");
+        DebugNdjson.Probe("test", "test", "disabled", new { secret = "document content" });
+        check(DebugNdjson.Snapshot().Length == before, "both diagnostic entry points are disabled by default");
         try
         {
             AppContext.SetSwitch("OfficeInEditor.Diagnostics", true);
-            for (var i = 0; i < 100; i++) DebugNdjson.Write("test", "test", "stage", new { secret = "document content" });
+            Parallel.For(0, 10000, i =>
+            {
+                if (i % 2 == 0) DebugNdjson.Write("test", "test", "stage", new { secret = "document content" });
+                else DebugNdjson.Probe("test", "test", "stage", new { secret = "document content" });
+            });
             check(DebugNdjson.Snapshot().Length == 64
                 && !System.Text.Json.JsonSerializer.Serialize(DebugNdjson.Snapshot()).Contains("document content", StringComparison.Ordinal),
-                "opt-in diagnostics are bounded and discard arbitrary payloads");
+                "concurrent diagnostic floods stay bounded and discard payloads through both entry points");
+            DebugNdjson.Probe(new string('s', 4096), "private/path", "private\ntext", new { secret = "document content" });
+            var diagnosticJson = System.Text.Json.JsonSerializer.Serialize(DebugNdjson.Snapshot());
+            check(diagnosticJson.Length < 32768 && diagnosticJson.Contains("invalid-stage", StringComparison.Ordinal)
+                && !diagnosticJson.Contains(new string('s', 256), StringComparison.Ordinal)
+                && !diagnosticJson.Contains("private", StringComparison.Ordinal),
+                "diagnostic stages reject oversized or non-identifier strings instead of retaining arbitrary text");
         }
         finally { AppContext.SetSwitch("OfficeInEditor.Diagnostics", false); }
     }

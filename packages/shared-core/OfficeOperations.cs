@@ -54,7 +54,7 @@ public sealed partial class CoreState
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
         timeout.CancelAfter(TimeSpan.FromSeconds(17));
-        try { return await PipeClient.CallAsync(office.PipeName, method, parameters, timeout.Token); }
+        try { return await PipeClient.CallOfficeAsync(office.PipeName, office.Pid, method, parameters, timeout.Token); }
         catch (CoreFault fault) { throw new CoreFault(fault.Code, "The Office adapter rejected the operation. Inspect its state before continuing."); }
         catch (Exception) { throw new CoreFault("office_outcome_unknown", "The Office response did not complete. Do not replay a possible write."); }
     }

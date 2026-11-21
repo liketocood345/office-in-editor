@@ -3,6 +3,7 @@
 .local/**
 node_modules/**
 packages/**
+experiments/**
 apps/**
 tests/**
 scripts/**
@@ -16,3 +17,4 @@ package-lock.json
 **/bin/**
 !payload/core/**
 !payload/office/**
+!payload/host/**

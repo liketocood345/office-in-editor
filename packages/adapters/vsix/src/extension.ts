@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import { randomUUID } from "node:crypto";
 import { stat } from "node:fs/promises";
 import * as path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import {
   NamedPipeBrokerTransport, OfficeBroker, OfficeBridgeError, errorCode, errorDescription, isRecord,
   referenceAsJson, referenceAsMarkdown,
@@ -14,8 +15,12 @@ import { InboxTree, displayText } from "./tree";
 import { ErrorNoticeBudget } from "./notices";
 import { actionButton, escapeHtml, hostHtml, panelHtml } from "./ui";
 import { tryHostBounds } from "./host-window";
-import { officeTabAppearance } from "./office-theme";
 import { isOfficeCacheFile, officeCacheOwnerPath } from "./office-cache";
+import { NativeHostClient, type NativeSurfaceInspection } from "./native-host";
+import { openOfficeLabPage } from "./office-page-lab";
+import { FOCUS_EXTENSIONS, FocusEditor, newSurfaceToken } from "./focus-editor";
+import { FocusStreamClient } from "./focus-stream";
+import { FOCUS_TEXT, focusHtml } from "./focus-ui";
 
 const REF_ID = /^(?:[a-f0-9]{32}|[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})$/iu;
 const DOCUMENT_EXTENSIONS = new Set([
@@ -93,9 +98,13 @@ class OfficeExtension implements vscode.Disposable {
   private readonly hostId = hostKind() + ":" + randomUUID();
   private readonly panels = new Map<string, vscode.WebviewPanel>();
   private readonly officeClosers = new Set<() => Promise<void>>();
+  private readonly nativeHost = new NativeHostClient();
   private readonly officeAligners = new Map<string, { panel: vscode.WebviewPanel; realign: () => Promise<void> }>();
   private traceEvents = 0;
-  private loading?: { stage: string; elapsedMs: number };
+  private loading?: { stage: string; elapsedMs: number; attempt: number };
+  private openAttempt = 0;
+  private nativeWord?: NativeSurfaceInspection;
+  private officeLabPage?: { port: number; requested: boolean };
   private readonly view: vscode.TreeView<import("./tree").InboxNode>;
   private lease?: HostLease;
   private snapshot?: DashboardSnapshot;
@@ -395,64 +404,109 @@ class OfficeExtension implements vscode.Disposable {
       panel.dispose();
       return;
     }
+    if (await this.useFocusRoute(uri)) {
+      await this.hostFocusDocument(uri, panel, mediaRoot);
+      return;
+    }
     const sessionId = "ole-" + randomUUID().replaceAll("-", "");
+    const surfaceToken = "oie-surface-" + sessionId.slice(4);
+    const attempt = ++this.openAttempt;
+    this.nativeWord = undefined;
+    this.officeLabPage = undefined;
     const started = performance.now();
     const trace = (stage: string): void => {
-      this.loading = { stage, elapsedMs: Math.round(performance.now() - started) };
+      if (attempt === this.openAttempt) this.loading = { stage, elapsedMs: Math.round(performance.now() - started), attempt };
       if (++this.traceEvents <= 1024) this.output.appendLine(`open=${sessionId.slice(4, 12)} stage=${stage} elapsedMs=${Math.round(performance.now() - started)}`);
     };
     trace("tab_created");
+    const pageLab = this.context.extensionMode === vscode.ExtensionMode.Development &&
+      process.env.OIE_NATIVE_LAB_HTTP === "1";
+    const officePage = pageLab ? await openOfficeLabPage(uri.fsPath) : undefined;
+    if (officePage) {
+      this.officeLabPage = { port: officePage.port, requested: false };
+      trace("office_page_listening");
+    }
     let officeId: string | undefined;
     let attached = false;
     let closed = false;
     let openStarted = false;
+    let slotCreated = false;
+    let slotRegistered = false;
+    let closePending: Promise<void> | undefined;
+    let prepareSlot: Promise<void> | undefined;
+    let releaseGeometry: (() => void) | undefined;
     let bounds: import("../../../adapter-sdk/src").HostBounds | undefined;
     let layoutRunning = false;
     let layoutVersion = 0;
     this.officeAligners.set(sessionId, { panel, realign: async () => {
       if (!officeId || closed || !bounds) throw new OfficeBridgeError("OFFICE_NOT_FOUND");
-      await this.broker.attachOfficeWindow(officeId, { ...bounds, visible: panel.visible });
+      const visible = slotCreated ? await this.nativeHost.layout(surfaceToken, panel.visible) : panel.visible;
+      await this.broker.attachOfficeWindow(officeId, { ...bounds, visible });
     } });
-    let lastLayoutKey = "";
+    let appliedLayoutKey = "";
     let revealLayout = false;
     const layout = async (message?: unknown): Promise<void> => {
       const next = tryHostBounds(message ?? bounds, bounds);
       if (!next) return;
       bounds = next;
       ++layoutVersion;
-      if (!officeId || closed || layoutRunning) return;
+      if (!officeId || closed || closePending || layoutRunning) return;
       layoutRunning = true;
       try {
         let sent: number;
         do {
           sent = layoutVersion;
-          await this.broker.layoutOfficeWindow(officeId, { ...bounds, visible: panel.visible });
-          attached = panel.visible;
+          const current = bounds;
+          const visible = slotCreated ? await this.nativeHost.layout(surfaceToken, panel.visible) : panel.visible;
+          const key = JSON.stringify([current, visible]);
+          if (appliedLayoutKey !== key) {
+            await this.broker.layoutOfficeWindow(officeId, { ...current, visible });
+            appliedLayoutKey = key;
+          }
+          attached = visible;
         } while (!closed && sent !== layoutVersion);
       } finally { layoutRunning = false; }
     };
-    const close = async (): Promise<void> => {
-      if (closed) return;
-      closed = true;
-      attached = false;
-      this.officeClosers.delete(close);
-      this.officeAligners.delete(sessionId);
-      const target = officeId ?? (openStarted ? sessionId : undefined);
-      if (!target) return;
-      try {
-        const broker = await this.connect();
-        await broker.detachOfficeWindow(target);
-      } catch (error) {
-      }
+    const close = (): Promise<void> => {
+      if (closed) return Promise.resolve();
+      closePending ??= (async () => {
+        releaseGeometry?.();
+        await prepareSlot?.catch(() => {});
+        const target = officeId ?? (openStarted ? sessionId : undefined);
+        if (target) {
+          try { await this.broker.detachOfficeWindow(target); }
+          catch (error) {
+            if (errorCode(error) !== "office_session_expired") throw error;
+          }
+          officeId = undefined;
+          openStarted = false;
+        }
+        if (slotRegistered) {
+          await this.broker.releaseNativeSurface(surfaceToken);
+          slotRegistered = false;
+        }
+        if (slotCreated) {
+          await this.nativeHost.release(surfaceToken);
+          slotCreated = false;
+        }
+        await officePage?.close();
+        closed = true;
+        attached = false;
+        this.officeClosers.delete(close);
+        this.officeAligners.delete(sessionId);
+      })().finally(() => { closePending = undefined; });
+      return closePending;
     };
     this.officeClosers.add(close);
     panel.webview.onDidReceiveMessage((message: unknown) => {
       if (isRecord(message) && message.action === "layout") {
+        if (message.surfaceToken !== surfaceToken) return;
         const sized = tryHostBounds(message, bounds);
         if (!sized) return;
         if (!bounds) {
           bounds = sized;
           trace("geometry_received");
+          releaseGeometry?.();
         }
         void panel.webview.postMessage({ kind: "layout-ack" });
         if (revealLayout && bounds && sized && (sized.width + 16 < bounds.width || sized.height + 16 < bounds.height)) {
@@ -460,10 +514,6 @@ class OfficeExtension implements vscode.Disposable {
           return;
         }
         if (sized) revealLayout = false;
-        const layoutKey = sized ? sized.width + "x" + sized.height : "";
-        if (sized && layoutKey !== lastLayoutKey) {
-          lastLayoutKey = layoutKey;
-        }
         void this.run(() => layout(message), false);
       }
       if (isRecord(message) && message.action === "ready") trace("webview_ready");
@@ -476,12 +526,11 @@ class OfficeExtension implements vscode.Disposable {
         }
       } catch { /* keepEditor is best-effort against preview replacement; do not pin. */ }
     };
-    const surfaceToken = "oie-surface-" + sessionId.slice(4);
     const loaderSrc = panel.webview.asWebviewUri(vscode.Uri.joinPath(mediaRoot, "beitou.gif")).toString();
     panel.webview.html = hostHtml(name, "正在加载 Office", surfaceToken, {
-      ...officeTabAppearance(),
       loaderSrc,
       cspSource: panel.webview.cspSource,
+      officePage,
     });
     void keepOfficeTab();
     panel.onDidChangeViewState(event => {
@@ -492,22 +541,36 @@ class OfficeExtension implements vscode.Disposable {
       void this.run(() => layout(bounds), false);
     }, undefined, this.context.subscriptions);
     panel.onDidDispose(() => {
-      void close();
+      void close().catch(error => {
+        trace("close_retained_" + errorCode(error));
+        if (slotCreated) void this.nativeHost.layout(surfaceToken, false).catch(() => {});
+      });
     }, undefined, this.context.subscriptions);
     await this.run(async () => {
+      if (officePage) {
+        const requested = await Promise.race([officePage.requested, delay(8500, false, { ref: false })]);
+        if (closed || closePending) return;
+        if (!requested || !this.nativeHost.available) {
+          trace(requested ? "open_failed_native_host_unavailable" : "open_failed_office_page_timeout");
+          void panel.webview.postMessage({ kind: "status", text: "网页承载初始化失败。" });
+          await close();
+          return;
+        }
+        if (attempt === this.openAttempt) this.officeLabPage = { port: officePage.port, requested: true };
+        trace("office_page_requested_open");
+      }
       const opening = this.connect();
       trace("connect_started");
       void opening.catch(() => {});
-      const overallDeadline = performance.now() + 60_000;
-      const geometryStarted = performance.now();
-      while (!closed && !bounds && performance.now() < overallDeadline) {
-        await panel.webview.postMessage({ kind: "layout-request" });
-        await new Promise(resolve => setTimeout(resolve, 50));
+      const overallDeadline = started + 30_000;
+      if (!bounds && !closed && !closePending) {
+        await new Promise<void>(resolve => {
+          const timer = setTimeout(() => releaseGeometry?.(), Math.max(0, overallDeadline - performance.now()));
+          releaseGeometry = () => { clearTimeout(timer); releaseGeometry = undefined; resolve(); };
+          void panel.webview.postMessage({ kind: "layout-request" });
+        });
       }
-      // #region agent log
-      fetch('http://127.0.0.1:7327/ingest/455da3f8-8da7-4d14-9d39-307205a1b093',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'4dd893'},body:JSON.stringify({sessionId:'4dd893',location:'extension.ts:geometry',message:'geometry_wait',data:{elapsedMs:Math.round(performance.now()-geometryStarted),hadBounds:!!bounds},timestamp:Date.now(),hypothesisId:'E',runId:'post-fix'})}).catch(()=>{});
-      // #endregion
-      if (closed) { await opening; return; }
+      if (closed || closePending) return;
       if (!bounds) {
         trace("geometry_timeout");
         await panel.webview.postMessage({ kind: "status", text: "标签几何初始化失败。" });
@@ -515,7 +578,7 @@ class OfficeExtension implements vscode.Disposable {
       }
       const broker = await opening;
       trace("core_connected");
-      if (closed) return;
+      if (closed || closePending) return;
       // Test-only handshake probe: deliberately never enters Office/OLE.
       if (this.context.extensionMode === vscode.ExtensionMode.Test && process.env.OIE_GEOMETRY_ONLY === "1") {
         trace("geometry_verified");
@@ -525,11 +588,21 @@ class OfficeExtension implements vscode.Disposable {
       }
       let opened;
       try {
+        if (this.nativeHost.available) {
+          prepareSlot = (async () => {
+            const identity = await this.nativeHost.create(surfaceToken, panel.visible, close);
+            slotCreated = true;
+            await broker.registerNativeSurface(surfaceToken, identity);
+            slotRegistered = true;
+            trace("native_slot_registered");
+          })();
+          await prepareSlot;
+          if (closed || closePending) return;
+        }
         const remaining = overallDeadline - performance.now();
         if (remaining < 250) throw new OfficeBridgeError("HOST_WINDOW_UNAVAILABLE");
         trace("office_open_started");
         openStarted = true;
-        officeId = sessionId;
         opened = await broker.openInOffice(uri.fsPath, "embedded", { fallback: false, ...bounds, visible: panel.visible, sessionId, timeoutMs: remaining, ackAlerts: this.ackAlertsEnabled() });
         trace("office_open_completed");
       }
@@ -538,28 +611,92 @@ class OfficeExtension implements vscode.Disposable {
         trace(`open_failed_${code}`);
         const text = code === "REQUEST_TIMEOUT" ? "打开超时。" : "原位打开未完成。";
         void panel.webview.postMessage({ kind: "status", text });
-        void broker.health().then(health => {
+        if (openStarted) void broker.health().then(health => {
           if (health.nativeHost && ++this.traceEvents <= 1024) this.output.appendLine(JSON.stringify({ nativeHost: health.nativeHost }));
         }).catch(() => {});
-        void close();
+        void close().catch(closeError => trace("close_retained_" + errorCode(closeError)));
         return;
       }
       if (opened.opened !== true || opened.mode !== "embedded" || opened.inplace !== true || typeof opened.officeId !== "string") {
         void panel.webview.postMessage({ kind: "status", text: "原位打开未完成。" });
-        void close();
+        void close().catch(closeError => trace("close_retained_" + errorCode(closeError)));
         return;
       }
+      if (closed || closePending || this.disposed) { await close(); return; }
       officeId = opened.officeId;
-      if (closed || this.disposed) { await broker.detachOfficeWindow(officeId); return; }
       await layout(bounds);
       await panel.webview.postMessage({ kind: "attached" });
       await keepOfficeTab();
+      if (slotCreated) {
+        const inspection = await this.nativeHost.inspect(surfaceToken).catch(() => undefined);
+        if (attempt === this.openAttempt) this.nativeWord = inspection;
+        if (inspection && ++this.traceEvents <= 1024) this.output.appendLine(JSON.stringify({ nativeSurface: inspection, attempt }));
+      }
       trace("attached");
     }, false);
   }
 
+  /**
+   * Route choice per tab: "focus" and "ole" force a route; "auto" (default) uses focus-hybrid for Word, Excel and
+   * PowerPoint whenever Core advertises it, and the OLE route otherwise.
+   */
+  private async useFocusRoute(uri: vscode.Uri): Promise<boolean> {
+    const route = vscode.workspace.getConfiguration("officeInEditor").get<string>("hostRoute", "auto");
+    if (route === "ole" || !FOCUS_EXTENSIONS.has(path.extname(uri.fsPath).toLowerCase())) return false;
+    if (route === "focus") return true;
+    try { return (await (await this.connect()).health()).capabilities.focusHybrid === true; }
+    catch { return false; }
+  }
+
+  private async hostFocusDocument(uri: vscode.Uri, panel: vscode.WebviewPanel, mediaRoot: vscode.Uri): Promise<void> {
+    const surfaceToken = newSurfaceToken();
+    const started = performance.now();
+    const label = surfaceToken.slice(12, 20);
+    const trace = (stage: string): void => {
+      if (++this.traceEvents <= 1024) this.output.appendLine(`focus=${label} stage=${stage} elapsedMs=${Math.round(performance.now() - started)}`);
+    };
+    panel.webview.html = focusHtml(surfaceToken, {
+      loaderSrc: panel.webview.asWebviewUri(vscode.Uri.joinPath(mediaRoot, "beitou.gif")).toString(),
+      cspSource: panel.webview.cspSource,
+    });
+    // Same as the OLE route: an Office tab never stays in the preview slot, where the next single click in the
+    // explorer would replace it and close the document in Office.
+    const keepOfficeTab = async (): Promise<void> => {
+      try { if (panel.active) await vscode.commands.executeCommand("workbench.action.keepEditor"); }
+      catch { /* keepEditor is best-effort; do not pin. */ }
+    };
+    void keepOfficeTab();
+    panel.onDidChangeViewState(event => {
+      if (event.webviewPanel.active) void keepOfficeTab();
+    }, undefined, this.context.subscriptions);
+    const policy = vscode.workspace.getConfiguration("officeInEditor").get<string>("pixelPolicy", "always");
+    const name = displayText(path.basename(uri.fsPath));
+    let broker: OfficeBroker;
+    try { broker = await this.connect(); }
+    catch (error) {
+      trace("connect_failed_" + errorCode(error));
+      await panel.webview.postMessage({ kind: "status", text: FOCUS_TEXT.openFailed, sticky: true, opaque: true });
+      return;
+    }
+    const editor = new FocusEditor(panel, uri.fsPath, surfaceToken, {
+      broker,
+      stream: (pipeName, token, surface, handlers) => new FocusStreamClient(pipeName, token, surface, handlers),
+      askSave: async () => {
+        const save = "保存", discard = "不保存";
+        const choice = await vscode.window.showWarningMessage(`是否保存对 ${name} 的更改？`, { modal: true }, save, discard);
+        return choice === save ? "save" : choice === discard ? "discard" : "cancel";
+      },
+      reopen: async () => vscode.commands.executeCommand("vscode.openWith", uri, "officeInEditor.document", { preview: false }),
+      trace,
+      error: code => { trace("error_" + code); void this.run(() => Promise.reject(new OfficeBridgeError(code)), true); },
+      pixelPolicy: policy === "switch" || policy === "mouse" ? policy : "always",
+      editorPid: process.ppid > 0 ? process.ppid : process.pid,
+    });
+    await editor.start();
+  }
+
   private ackAlertsEnabled(): boolean {
-    return this.context.workspaceState.get("officeInEditor.ackAlerts", true) !== false;
+    return this.context.workspaceState.get<boolean>("officeInEditor.ackAlerts", true) !== false;
   }
 
   private async toggleAckAlerts(): Promise<void> {
@@ -771,6 +908,8 @@ class OfficeExtension implements vscode.Disposable {
     return {
       version: displayText(this.context.extension.packageJSON.version, 64),
       loading: this.loading,
+      nativeWord: this.nativeWord,
+      officeLabPage: this.officeLabPage,
       hostKind: hostKind(),
       mcpMode: this.mcp.status.mode,
       capabilities: {
@@ -790,6 +929,7 @@ class OfficeExtension implements vscode.Disposable {
     this.shutdownPromise ??= (async () => {
       this.disposed = true;
       await Promise.allSettled([...this.officeClosers].map(close => close()));
+      this.nativeHost.dispose();
       this.statusMessage?.dispose();
       this.mcp.dispose();
       if (this.lease) {
@@ -807,7 +947,9 @@ class OfficeExtension implements vscode.Disposable {
 let activeExtension: OfficeExtension | undefined;
 
 export interface OfficeExtensionDiagnostics {
-  loading?: { stage: string; elapsedMs: number };
+  loading?: { stage: string; elapsedMs: number; attempt: number };
+  nativeWord?: NativeSurfaceInspection;
+  officeLabPage?: { port: number; requested: boolean };
   version: string;
   hostKind: "vscode" | "cursor";
   mcpMode: import("./mcp").McpRegistrationStatus["mode"];

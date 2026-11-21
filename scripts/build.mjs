@@ -6,6 +6,7 @@ import { writeLicenseNotices } from './license-notices.mjs';
 const root = process.cwd();
 function run(command, args) {
   const result = spawnSync(command, args, { cwd: root, stdio: 'inherit', shell: false, windowsHide: true });
+  if (result.error) throw result.error;
   if (result.status !== 0) throw new Error(`Build failed: ${command}`);
 }
 await mkdir('artifacts', { recursive: true });
@@ -20,6 +21,10 @@ run('dotnet', ['publish', 'packages/shared-core/OfficeInEditor.Core.csproj', '-c
 await writeFile('payload/core/mcp-app.html', html);
 run('dotnet', ['build', 'packages/office-addin/OfficeInEditor.OfficeAddin.csproj', '-c', 'Release', '-p:DebugType=None', '-p:DebugSymbols=false',
   '-o', path.join(root, 'payload/office')]);
+const pwsh = spawnSync('pwsh.exe', ['-NoProfile', '-Command', 'exit 0'], { windowsHide: true, stdio: 'ignore' });
+run(pwsh.status === 0 ? 'pwsh.exe' : 'powershell.exe', ['-NoProfile', '-File', 'packages/native-host/build.ps1']);
+// Focus-hybrid capture helper sits next to Core; its presence turns on health.capabilities.focusHybrid.
+run(pwsh.status === 0 ? 'pwsh.exe' : 'powershell.exe', ['-NoProfile', '-File', 'packages/focus-capture/build.ps1']);
 // Include the existing license and explicit third-party notices in local payloads.
 await cp('LICENSE', 'payload/LICENSE');
 if (await readFile('THIRD_PARTY_NOTICES.md', 'utf8').catch(() => null)) await cp('THIRD_PARTY_NOTICES.md', 'payload/THIRD_PARTY_NOTICES.md');

@@ -1,8 +1,11 @@
 [CmdletBinding(SupportsShouldProcess=$true)]
-param([string]$PayloadRoot=(Join-Path $PSScriptRoot '..\payload'),[string]$VsixPath='',
+param([string]$PayloadRoot='',[string]$VsixPath='',
   [ValidateSet('vscode','cursor')][string[]]$Hosts=@('vscode','cursor'),[string]$InstallRoot='',
   [switch]$SkipOfficeRegistration,[switch]$SkipEditors,[switch]$ValidateOnly)
 $ErrorActionPreference='Stop'
+# Windows PowerShell 5.1 leaves $PSScriptRoot empty inside param() defaults, so resolve the default here.
+$scriptRoot=if($PSScriptRoot){$PSScriptRoot}else{Split-Path -Parent $MyInvocation.MyCommand.Path}
+if(-not $PayloadRoot){$PayloadRoot=Join-Path $scriptRoot '..\payload'}
 . (Join-Path $PSScriptRoot 'installation-common.ps1')
 $productBase=[IO.Path]::GetFullPath((Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Programs\OfficeInEditor')).TrimEnd([IO.Path]::DirectorySeparatorChar)
 if(-not $InstallRoot){$InstallRoot=Join-Path $productBase 'current'}
@@ -90,6 +93,16 @@ try{
     else{$hostRecord.state='installed';$results.Add([ordered]@{component=$kind;status='installed'})}
     Save-OieManifest $manifestPath $record
   }}
+  # Elevated Office (built-in admin with UAC off) ignores HKCU COM classes. A machine-wide lab registration made by
+  # experiments/focus-hybrid/register-lab-com.ps1 then keeps loading its own copy, so report it when it is stale.
+  $labKey='Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Classes\CLSID\{6B4072D4-3EB1-4CAB-995D-4F922B19D4B1}'
+  $labOwner=(Get-ItemProperty -LiteralPath $labKey -ErrorAction SilentlyContinue).OfficeInEditorOwner
+  if($labOwner -eq 'office-in-editor:focus-lab-com:v1'){
+    $labCodeBase=[string](Get-ItemProperty -LiteralPath ($labKey+'\InprocServer32') -ErrorAction SilentlyContinue).CodeBase
+    $installedSha=(Get-FileHash -LiteralPath (Join-Path $root 'office\OfficeInEditor.Addin.dll') -Algorithm SHA256).Hash.ToLowerInvariant()
+    $current=$labCodeBase -match [regex]::Escape($installedSha)
+    $results.Add([ordered]@{component='office-machine-lab-registration';status=if($current){'current'}else{'stale_rerun_register-lab-com'}})
+  }
   $record.transactionState=if(@($results.ToArray()|Where-Object{$_.status -eq 'failed'}).Count){'partial'}else{'complete'}
   $record.pendingFiles=@();Save-OieManifest $manifestPath $record
 }catch{

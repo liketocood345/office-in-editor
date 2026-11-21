@@ -1,0 +1,13 @@
+{
+  "name": "office-focus-hybrid-lab",
+  "publisher": "oie-local",
+  "displayName": "Office Focus Hybrid Lab",
+  "version": "0.0.1",
+  "engines": { "vscode": "^1.121.0" },
+  "private": true,
+  "main": "./extension.cjs",
+  "activationEvents": ["onStartupFinished", "onMcpServerDefinitionProvider:office-in-editor"],
+  "contributes": {
+    "mcpServerDefinitionProviders": [{"id": "office-in-editor", "label": "Office in Editor"}]
+  }
+}

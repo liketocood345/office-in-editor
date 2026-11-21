@@ -117,8 +117,11 @@ public sealed class AppServer(CoreState state) : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         if (application is null) return;
+        CoreTrace.Mark("app", "stopping");
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(3));
         try { await application.StopAsync(timeout.Token); } catch (OperationCanceledException) { }
+        CoreTrace.Mark("app", "stopped");
         await application.DisposeAsync();
+        CoreTrace.Mark("app", "disposed");
     }
 }

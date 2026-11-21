@@ -1,0 +1,9 @@
+{
+  "name": "native-slot-lab",
+  "publisher": "office-in-editor-lab",
+  "version": "0.0.1",
+  "private": true,
+  "engines": { "vscode": "^1.100.0" },
+  "main": "./extension.cjs",
+  "activationEvents": ["onStartupFinished"]
+}

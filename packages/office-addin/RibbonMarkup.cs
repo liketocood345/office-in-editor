@@ -48,6 +48,12 @@ namespace OfficeInEditor.OfficeAddin
                 + "<toggleButton id=\"OieSaveOnClose\" label=\"关标签保存\" getPressed=\"GetSaveOnClose\" onAction=\"SetSaveOnClose\"/>"
                 + "<toggleButton id=\"OieAckAlerts\" label=\"自动确认警告\" getPressed=\"GetAckAlerts\" onAction=\"SetAckAlerts\"/>"
                 + "<editBox id=\"OieSaveInterval\" label=\"间隔（秒）\" getText=\"GetSaveInterval\" onChange=\"SetSaveInterval\" maxLength=\"4\"/>"
+                + "</group><group id=\"OieCaptureGroup\" label=\"像素转发\">"
+                + "<dropDown id=\"OieCapturePolicy\" label=\"激活方式\" getSelectedItemID=\"GetCapturePolicy\" onAction=\"SetCapturePolicy\">"
+                + "<item id=\"OieCaptureAlways\" label=\"像素转发常开\"/>"
+                + "<item id=\"OieCaptureOnSwitch\" label=\"只有切换才激活\"/>"
+                + "<item id=\"OieCaptureOnMouse\" label=\"移动鼠标激活像素转发\"/>"
+                + "</dropDown>"
                 + "</group></tab></tabs></ribbon>";
         }
 

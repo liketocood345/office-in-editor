@@ -1,0 +1,22 @@
+{
+  "name": "word-webview-lab",
+  "publisher": "oie-local",
+  "version": "0.0.1",
+  "private": true,
+  "engines": { "vscode": "^1.121.0" },
+  "main": "./extension.cjs",
+  "extensionKind": ["ui"],
+  "activationEvents": ["onStartupFinished"],
+  "capabilities": {
+    "untrustedWorkspaces": { "supported": false },
+    "virtualWorkspaces": { "supported": false }
+  },
+  "contributes": {
+    "customEditors": [{
+      "viewType": "oieLocal.wordWebviewLab",
+      "displayName": "Office in Editor Web Lab",
+      "priority": "default",
+      "selector": [{ "filenamePattern": "synthetic.docx" }]
+    }]
+  }
+}

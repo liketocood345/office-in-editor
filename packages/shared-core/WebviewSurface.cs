@@ -156,6 +156,106 @@ internal static class WebviewSurface
             && placement.Width == client.Right - client.Left && placement.Height == client.Bottom - client.Top;
     }
 
+    internal static ScreenBounds ClientOrigin(int width, int height) => new(0, 0, width, height);
+
+    internal static bool IsGpuSurface(IntPtr hwnd) =>
+        hwnd != IntPtr.Zero && ClassName(hwnd).StartsWith("Chrome_RenderWidgetHostHWND", StringComparison.Ordinal);
+
+    internal static bool IsTightSlot(int x, int y, int width, int height, int clientW, int clientH, int slack = 16) =>
+        Math.Abs(x) <= slack && Math.Abs(y) <= slack
+        && Math.Abs(width - clientW) <= slack && Math.Abs(height - clientH) <= slack
+        && width >= 32 && height >= 32 && clientW >= 32 && clientH >= 32;
+
+    /// <summary>
+    /// Map a token rectangle onto a Win32 parent that can actually host a child.
+    /// Never parent into Chromium's GPU surface (RenderWidgetHostHWND): it paints over native children.
+    /// Prefer a HWND whose client equals the token; otherwise sit as a sibling of that GPU surface.
+    /// </summary>
+    internal static bool TryEditorContainer(Placement placement, out IntPtr container, out int x, out int y, out int width, out int height)
+    {
+        container = IntPtr.Zero;
+        x = y = width = height = 0;
+        if (placement.Parent == IntPtr.Zero || !IsIdeRoot(placement.Parent)) return false;
+        var token = new ScreenBounds(placement.X, placement.Y, placement.Width, placement.Height);
+        if (!ValidBounds(token)) return false;
+        IntPtr best = IntPtr.Zero;
+        var bestX = 0;
+        var bestY = 0;
+        var bestW = 0;
+        var bestH = 0;
+        var bestRank = int.MaxValue;
+        var bestArea = long.MaxValue;
+        void Consider(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero || !NativeWindow.IsWindow(hwnd) || IsGpuSurface(hwnd)) return;
+            if (!TryMapToken(hwnd, token, out var cx, out var cy, out var cw, out var ch)) return;
+            if (!NativeWindow.GetClientRect(hwnd, out var client)) return;
+            var clientW = client.Right - client.Left;
+            var clientH = client.Bottom - client.Top;
+            if (CoversWorkbench(clientW, clientH, cw, ch) && !IsTightSlot(cx, cy, cw, ch, clientW, clientH))
+                return;
+            var tight = IsTightSlot(cx, cy, cw, ch, clientW, clientH);
+            var rank = tight ? 0 : 1;
+            long area = (long)Math.Max(1, clientW) * Math.Max(1, clientH);
+            if (rank > bestRank || (rank == bestRank && area >= bestArea)) return;
+            best = hwnd;
+            bestX = cx;
+            bestY = cy;
+            bestW = cw;
+            bestH = ch;
+            bestRank = rank;
+            bestArea = area;
+        }
+
+        var hit = NativeWindow.WindowFromPoint(token.X + token.Width / 2, token.Y + token.Height / 2);
+        for (var depth = 0; hit != IntPtr.Zero && depth < 12; depth++)
+        {
+            if (ClassName(hit).StartsWith("OieOleHost_", StringComparison.Ordinal) || IsGpuSurface(hit))
+            {
+                hit = NativeWindow.GetParent(hit);
+                continue;
+            }
+            Consider(hit);
+            hit = NativeWindow.GetParent(hit);
+        }
+        foreach (var hwnd in SurfaceWindows(placement.Parent))
+        {
+            if (IsGpuSurface(hwnd))
+            {
+                Consider(NativeWindow.GetParent(hwnd));
+                continue;
+            }
+            Consider(hwnd);
+        }
+        if (best == IntPtr.Zero) return false;
+        container = best;
+        x = bestX;
+        y = bestY;
+        width = bestW;
+        height = bestH;
+        return true;
+    }
+
+    private static bool TryMapToken(IntPtr hwnd, ScreenBounds token, out int x, out int y, out int width, out int height)
+    {
+        x = y = width = height = 0;
+        var origin = new NativeWindow.Point { X = token.X, Y = token.Y };
+        if (!NativeWindow.ScreenToClient(hwnd, ref origin) || !NativeWindow.GetClientRect(hwnd, out var client))
+            return false;
+        var clientW = client.Right - client.Left;
+        var clientH = client.Bottom - client.Top;
+        x = Math.Max(0, origin.X);
+        y = Math.Max(0, origin.Y);
+        if (origin.X < -8 || origin.Y < -8) return false;
+        if (x + token.Width > clientW + 8 || y + token.Height > clientH + 8) return false;
+        width = Math.Min(token.Width, Math.Max(0, clientW - x));
+        height = Math.Min(token.Height, Math.Max(0, clientH - y));
+        return width >= 32 && height >= 32;
+    }
+
+    private static bool CoversWorkbench(int clientW, int clientH, int width, int height) =>
+        (long)width * height * 100 >= (long)Math.Max(1, clientW) * Math.Max(1, clientH) * 80;
+
     internal static string ClassName(IntPtr hwnd)
     {
         if (hwnd == IntPtr.Zero) return "";
@@ -193,15 +293,7 @@ internal static class WebviewSurface
             attempts++;
             var found = TryResolve(token, search);
             if (found is not null)
-            {
-                var elapsedMs = (long)Stopwatch.GetElapsedTime(started).TotalMilliseconds;
-                // #region agent log
-                if (elapsedMs >= 80 || attempts > 1)
-                    DebugNdjson.Probe("I", "WebviewSurface.Resolve", "hit",
-                        new { elapsedMs, attempts, how = found.Value.How, owners = search.Owners, surfaces = search.Surfaces });
-                // #endregion
                 return found;
-            }
             if (Environment.TickCount64 >= until)
             {
                 // #region agent log

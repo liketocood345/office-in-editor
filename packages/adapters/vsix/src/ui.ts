@@ -42,32 +42,34 @@ export function hostHtml(
   title: string,
   message: string,
   surfaceToken: string,
-  appearance?: { background: string; foreground: string; loaderSrc?: string; cspSource?: string },
+  appearance?: { loaderSrc?: string; cspSource?: string; officePage?: { url: string; origin: string } },
 ): string {
   void title;
   const nonce = randomBytes(18).toString("base64");
   const token = escapeHtml(surfaceToken);
-  const background = escapeHtml(appearance?.background || "#FFFFFF");
-  const foreground = escapeHtml(appearance?.foreground || "#201F1E");
   const loaderSrc = appearance?.loaderSrc ? escapeHtml(appearance.loaderSrc) : "";
   const imgCsp = appearance?.cspSource ? ` img-src ${appearance.cspSource};` : "";
+  const officePage = appearance?.officePage;
+  const pageCsp = officePage ? ` frame-src ${escapeHtml(officePage.origin)};` : "";
+  const frame = officePage ? `<iframe class="office-page" title="本机 Office" sandbox="allow-scripts allow-same-origin" src="${escapeHtml(officePage.url)}"></iframe>` : "";
   const loaderImg = loaderSrc
     ? `<img id="status-loader" class="host-loader-gif" width="90" height="90" alt="" src="${loaderSrc}">`
     : "";
   return `<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';${imgCsp} base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';${imgCsp}${pageCsp} base-uri 'none'; form-action 'none'">
 <title>${token}</title>
 <style nonce="${nonce}">
-html,body,#ole-root{margin:0;height:100%;width:100%;min-height:100%;min-width:100%;overflow:hidden;background:${background}!important;color:${foreground}}
+html,body,#ole-root{margin:0;height:100%;width:100%;min-height:100%;min-width:100%;overflow:hidden;background:var(--vscode-editor-background);color:var(--vscode-foreground)}
 #ole-root{position:absolute;inset:0}
-.host-status{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;padding:24px;text-align:center;color:${foreground};font-family:var(--vscode-font-family)}
+.office-page{position:absolute;inset:0;width:100%;height:100%;border:0}
+.host-status{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;padding:24px;text-align:center;color:var(--vscode-foreground);font-family:var(--vscode-font-family)}
 .host-loader{display:flex;flex-direction:column;align-items:center;justify-content:center}
 .host-loader-gif{width:90px;height:90px;object-fit:contain;display:block;flex:none}
 .host-loader-line{margin:16px 0 0;padding:0;font:inherit;color:inherit;line-height:1.4}
 .host-ready{position:absolute;inset:0}
-.oie-beacon{position:absolute;width:1px;height:1px;padding:0;margin:0;border:0;border-radius:0;pointer-events:none;z-index:3;background:${background}}
+.oie-beacon{position:absolute;width:1px;height:1px;padding:0;margin:0;border:0;border-radius:0;pointer-events:none;z-index:3;background:#000}
 .oie-beacon[data-oie-beacon="tl"]{left:0;top:0}
 .oie-beacon[data-oie-beacon="tr"]{right:0;top:0}
 .oie-beacon[data-oie-beacon="bl"]{left:0;bottom:0}
@@ -75,6 +77,7 @@ html,body,#ole-root{margin:0;height:100%;width:100%;min-height:100%;min-width:10
 [hidden]{display:none!important}
 </style></head><body>
 <div id="ole-root" class="ole-root" role="application" aria-label="${token}" title="${token}" data-oie-surface="${token}">
+${frame}
 <div class="oie-beacon" data-oie-beacon="tl" role="img" aria-label="${token}:tl"></div>
 <div class="oie-beacon" data-oie-beacon="tr" role="img" aria-label="${token}:tr"></div>
 <div class="oie-beacon" data-oie-beacon="bl" role="img" aria-label="${token}:bl"></div>
@@ -113,13 +116,6 @@ window.addEventListener('message',event=>{
   const data=event.data||{};
   if(data.kind==='layout-ack') acknowledged=true;
   if(data.kind==='layout-request') report();
-  if(data.kind==='theme'&&typeof data.background==='string'&&typeof data.foreground==='string'){
-    document.documentElement.style.background=data.background;
-    document.body.style.background=data.background;
-    document.body.style.color=data.foreground;
-    if(root){root.style.background=data.background;root.style.color=data.foreground;}
-    statusNode.style.color=data.foreground;
-  }
   if(data.kind==='status'&&typeof data.text==='string'){
     stopLoader();
     if(statusLoader) statusLoader.hidden=true;

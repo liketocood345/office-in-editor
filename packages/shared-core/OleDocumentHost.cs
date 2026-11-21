@@ -31,6 +31,7 @@ internal static class OleDocumentHost
     private const uint WsExNoActivate = 0x08000000;
     private const int SwShow = 5;
     private const int SwHide = 0;
+    private const int GwlStyle = -16;
     private const int GwlExStyle = -20;
     private const int SOk = 0;
     private const int ENotimpl = unchecked((int)0x80004001);
@@ -67,8 +68,17 @@ internal static class OleDocumentHost
     internal static string LastFailure { get { lock (Gate) return lastFailure; } }
     private const uint SwpNoActivate = 0x0010;
     private const uint SwpNoZOrder = 0x0004;
+    private const uint SwpFrameChanged = 0x0020;
     private const uint SwpShowWindow = 0x0040;
     private const uint SwpHideWindow = 0x0080;
+    private const int WsBorder = 0x00800000;
+    private const int WsDlgFrame = 0x00400000;
+    private const int WsThickFrame = 0x00040000;
+    private const int WsCaption = 0x00C00000;
+    private const int WsExClientEdge = 0x00000200;
+    private const int WsExWindowEdge = 0x00000100;
+    private const int WsExStaticEdge = 0x00020000;
+    private const int WsExDlgModalFrame = 0x00000001;
     private const uint RdwInvalidate = 0x0001;
     private const uint RdwAllChildren = 0x0080;
     private const uint RdwUpdatenow = 0x0100;
@@ -235,7 +245,7 @@ internal static class OleDocumentHost
     {
         var code = error is COMException com
             ? "com:" + unchecked((uint)com.HResult).ToString("X8")
-            : "ex:" + error.GetType().Name;
+            : error is CoreFault fault ? "core:" + fault.Code : "ex:" + error.GetType().Name;
         lock (Gate) lastFailure = step + ":" + code;
         Trace("failed_" + step + "_" + code);
     }
@@ -256,12 +266,8 @@ internal static class OleDocumentHost
         {
             site = new OleSite { DocumentPath = path, SourceBound = bindSource, Sta = host.Sta, PixelRatio = pixelRatio,
                 Files = NativeSessionFiles.Create(path, sessionId, backupId), ForceDirty = !string.IsNullOrEmpty(backupId), OwnObject = true, SaveOnClose = true, AckAlerts = OfficeDialogAck.Enabled };
-            site.CreateWindow();
+            site.CreateWindow(surfaceToken);
             Trace("container_created");
-            // #region agent log
-            DebugNdjson.Probe("H", "OleDocumentHost.OpenOnSta", "files_ready",
-                new { kind = kind.Key, elapsedMs = Environment.TickCount64 - openedAt });
-            // #endregion
             step = "place";
             site.Place(surfaceToken, false, width, height, 0, jsX, jsY);
             EnterOleExclusive(cancellation, kind.Key);
@@ -296,10 +302,6 @@ internal static class OleDocumentHost
                 cancellation.ThrowIfCancellationRequested();
                 Trace("ole_create_completed");
                 HideNewFrames(existingFrames ?? [], site.Handle, protectPids ?? []);
-                // #region agent log
-                DebugNdjson.Probe("E", "OleDocumentHost.OpenOnSta", "create_swept",
-                    new { kind = kind.Key, elapsedMs = Environment.TickCount64 - openedAt });
-                // #endregion
             }
             step = "cast";
             var oleObject = (IOleObject)unknown;
@@ -370,10 +372,6 @@ internal static class OleDocumentHost
             try { site.ActivateInPlace(); }
             finally { HideNewFrames(existingFrames ?? [], site.Handle, protectPids ?? []); }
             Trace("activation_completed");
-            // #region agent log
-            DebugNdjson.Probe("H", "OleDocumentHost.OpenOnSta", "activated",
-                new { kind = kind.Key, elapsedMs = Environment.TickCount64 - openedAt });
-            // #endregion
             session.Activated = true;
             GetWindowThreadProcessId(site.ViewHandle == IntPtr.Zero ? site.Handle : site.ViewHandle, out var documentPid);
             session.ServerPid = (int)documentPid;
@@ -386,10 +384,6 @@ internal static class OleDocumentHost
                 throw new OperationCanceledException(cancellation);
             }
             if (visible) site.Place(surfaceToken, true, width, height, 1200, jsX, jsY);
-            // #region agent log
-            DebugNdjson.Probe("H", "OleDocumentHost.OpenOnSta", "placed",
-                new { kind = kind.Key, elapsedMs = Environment.TickCount64 - openedAt, haveInsets = site.SurfaceReady });
-            // #endregion
             site.ResolveNativeObjectModel(kind.Application);
             if (kind.Application == "word" && site.NativeObjectModelHandle == IntPtr.Zero)
             {
@@ -484,7 +478,7 @@ internal static class OleDocumentHost
             SaveOnClose = shared.SaveOnClose
         };
         target.ShellCopy = true;
-        target.CreateWindow();
+        target.CreateWindow(surfaceToken);
         target.Place(surfaceToken, false, width, height, 400, jsX, jsY);
         shared.AddCopy(target);
         shared.Views++;
@@ -1144,7 +1138,7 @@ internal static class OleDocumentHost
         private int nestedX, nestedY, nestedW, nestedH, ownerLeft, ownerTop;
         private int insetL, insetT, insetR, insetB;
         private uint ownerDpi;
-        private int pendingCssW, pendingCssH, lastOwnerW, lastOwnerH;
+        private int pendingCssW, pendingCssH, lastOwnerW, lastOwnerH, lastClientW, lastClientH;
         private bool haveInsets;
         private bool pendingViewLayout;
         private string nestedHow = "";
@@ -1161,8 +1155,17 @@ internal static class OleDocumentHost
         private bool keepInPlaceWhileHidden;
         private IOleInPlaceActiveObject? activeObject;
         internal OleSite() => wndProc = WndProc;
-        internal void CreateWindow()
+        internal void CreateWindow(string surfaceToken)
         {
+            var parent = IntPtr.Zero;
+            if (NativeSurfaceRegistry.IsRegistered(surfaceToken))
+            {
+                if (!NativeSurfaceRegistry.TryPlacement(surfaceToken, out var native))
+                    throw new CoreFault("native_surface_expired", "The native editor slot is unavailable.");
+                parent = native.Parent;
+                nestedHow = "native-slot";
+            }
+            using var dpi = parent == IntPtr.Zero ? null : NativeWindow.EnterWindowDpi(parent);
             var windowClass = new NativeWindow.WndClassEx
             {
                 cbSize = (uint)Marshal.SizeOf<NativeWindow.WndClassEx>(),
@@ -1172,10 +1175,13 @@ internal static class OleDocumentHost
                 lpszClassName = className
             };
             if (NativeWindow.RegisterClassEx(ref windowClass) == 0) throw new InvalidOperationException();
-            var ex = WsExToolwindow | (ShellCopy ? WsExNoActivate : 0u);
+            var ex = parent == IntPtr.Zero ? WsExToolwindow | (ShellCopy ? WsExNoActivate : 0u) : 0u;
+            const uint childStyle = 0x40000000 | 0x04000000 | WsClipChildren;
             Handle = NativeWindow.CreateWindowEx(ex, className, "",
-                WsPopup | WsClipChildren, 0, 0, 32, 32, IntPtr.Zero, IntPtr.Zero, windowClass.hInstance, IntPtr.Zero);
-            if (Handle == IntPtr.Zero) throw new InvalidOperationException();
+                parent == IntPtr.Zero ? WsPopup | WsClipChildren : childStyle, 0, 0, 32, 32, parent,
+                IntPtr.Zero, windowClass.hInstance, IntPtr.Zero);
+            if (Handle == IntPtr.Zero || (parent != IntPtr.Zero && !NativeWindow.IsChildHosted(Handle, parent)))
+                throw new CoreFault("native_container_create", "The Office container could not be created under its tab.");
         }
         internal bool IsDirty
         {
@@ -1268,9 +1274,14 @@ internal static class OleDocumentHost
                 var view = ViewportRect();
                 if (!hasAppliedView || !SameRect(lastAppliedView, view))
                 {
-                    Marshal.ThrowExceptionForHR(documentView.SetRect(ref view));
+                    var pos = view;
+                    var clip = view;
+                    Marshal.ThrowExceptionForHR(documentView.SetRect(ref pos));
+                    if (Object is IOleInPlaceObject inplace)
+                        inplace.SetObjectRects(ref pos, ref clip);
                     lastAppliedView = view;
                     hasAppliedView = true;
+                    FlushDocumentChrome(view);
                 }
                 completed = true;
             }
@@ -1283,6 +1294,97 @@ internal static class OleDocumentHost
         }
         private static bool SameRect(NativeRect a, NativeRect b) =>
             a.Left == b.Left && a.Top == b.Top && a.Right == b.Right && a.Bottom == b.Bottom;
+        private void FlushDocumentChrome(NativeRect view, bool probe = false)
+        {
+            var shadows = new List<IntPtr>();
+            var docs = new List<(IntPtr hwnd, string cls)>();
+            NativeWindow.EnumChildWindows(Handle, (hwnd, _) =>
+            {
+                if (hwnd == Handle) return true;
+                var name = new StringBuilder(32);
+                NativeWindow.GetClassName(hwnd, name, name.Capacity);
+                var cls = name.ToString();
+                if (cls == "DropShadow") shadows.Add(hwnd);
+                else if (cls is "_WwB" or "_WwC" or "_WwT" or "_WwU" or "_WwG") docs.Add((hwnd, cls));
+                return true;
+            }, IntPtr.Zero);
+            foreach (var hwnd in shadows) ShowWindow(hwnd, SwHide);
+            foreach (var cls in new[] { "_WwB", "_WwC", "_WwT", "_WwU", "_WwG" })
+            {
+                foreach (var item in docs)
+                {
+                    if (item.cls != cls) continue;
+                    StripDocumentChrome(item.hwnd);
+                    FitChildToView(item.hwnd, view);
+                    if (item.cls == "_WwG") NativeWindow.SendToBack(item.hwnd);
+                }
+            }
+            // #region agent log
+            if (probe) ProbeChromeAfter(shadows.Count, docs.Count);
+            // #endregion
+        }
+        private void ProbeChromeAfter(int shadowCount, int docCount)
+        {
+            NativeWindow.GetWindowRect(Handle, out var host);
+            var reports = new List<object>();
+            var leftover = 0;
+            NativeWindow.EnumChildWindows(Handle, (hwnd, _) =>
+            {
+                if (hwnd == Handle) return true;
+                var name = new StringBuilder(32);
+                NativeWindow.GetClassName(hwnd, name, name.Capacity);
+                var cls = name.ToString();
+                if (cls is not ("DropShadow" or "_WwB" or "_WwC" or "_WwT" or "_WwU" or "_WwG")) return true;
+                NativeWindow.GetWindowRect(hwnd, out var wr);
+                NativeWindow.GetClientRect(hwnd, out var cr);
+                var padX = (wr.Right - wr.Left) - (cr.Right - cr.Left);
+                var padY = (wr.Bottom - wr.Top) - (cr.Bottom - cr.Top);
+                if (padX > 0 || padY > 0) leftover++;
+                if (reports.Count < 12)
+                    reports.Add(new
+                    {
+                        cls,
+                        x = wr.Left - host.Left,
+                        y = wr.Top - host.Top,
+                        w = wr.Right - wr.Left,
+                        h = wr.Bottom - wr.Top,
+                        padX,
+                        padY,
+                        vis = NativeWindow.IsWindowVisible(hwnd) ? 1 : 0,
+                        style = NativeWindow.GetWindowLong(hwnd, GwlStyle),
+                        ex = NativeWindow.GetWindowLong(hwnd, GwlExStyle)
+                    });
+                return true;
+            }, IntPtr.Zero);
+            if (leftover > 0)
+                DebugNdjson.Probe("K", "OleSite.FlushDocumentChrome", "after",
+                    new { shadows = shadowCount, docs = docCount, leftover, reports });
+        }
+        private static void StripDocumentChrome(IntPtr hwnd)
+        {
+            var style = NativeWindow.GetWindowLong(hwnd, GwlStyle);
+            NativeWindow.SetWindowLong(hwnd, GwlStyle, style & ~WsCaption & ~WsDlgFrame & ~WsThickFrame & ~WsBorder);
+            var ex = NativeWindow.GetWindowLong(hwnd, GwlExStyle);
+            NativeWindow.SetWindowLong(hwnd, GwlExStyle, ex & ~WsExClientEdge & ~WsExWindowEdge & ~WsExStaticEdge & ~WsExDlgModalFrame);
+            NativeWindow.SetWindowPos(hwnd, IntPtr.Zero, 0, 0, 0, 0,
+                SwpNoZOrder | SwpNoActivate | SwpFrameChanged | 0x0001 | 0x0002);
+        }
+        private void FitChildToView(IntPtr hwnd, NativeRect view)
+        {
+            var parent = NativeWindow.GetParent(hwnd);
+            if (parent == IntPtr.Zero) parent = Handle;
+            if (parent == Handle)
+            {
+                NativeWindow.SetWindowPos(hwnd, IntPtr.Zero, view.Left, view.Top,
+                    Math.Max(32, view.Right - view.Left), Math.Max(32, view.Bottom - view.Top),
+                    SwpNoZOrder | SwpNoActivate | SwpFrameChanged);
+                return;
+            }
+            NativeWindow.GetClientRect(parent, out var pc);
+            NativeWindow.SetWindowPos(hwnd, IntPtr.Zero, 0, 0,
+                Math.Max(32, pc.Right - pc.Left), Math.Max(32, pc.Bottom - pc.Top),
+                SwpNoZOrder | SwpNoActivate | SwpFrameChanged);
+        }
         private bool NeedsViewLayout()
         {
             if (disposed || documentView is null) return false;
@@ -1294,6 +1396,32 @@ internal static class OleDocumentHost
         internal void Place(string token, bool show, int width = 0, int height = 0, int resolveMs = 6000, int jsX = 0, int jsY = 0)
         {
             using var physicalCoordinates = WebviewSurface.EnterPhysicalCoordinates();
+            if (nestedHow == "native-slot" || NativeSurfaceRegistry.IsRegistered(token))
+            {
+                if (!NativeSurfaceRegistry.TryPlacement(token, out var native))
+                    throw new CoreFault("native_surface_expired", "The native editor slot is unavailable.");
+                PauseBeaconCalibrate();
+                var resized = nestedOwner != native.Parent || nestedW != native.Width || nestedH != native.Height;
+                var reveal = show && !Visible;
+                nestedToken = token;
+                nestedOwner = native.Parent;
+                nestedX = nestedY = 0;
+                nestedW = native.Width;
+                nestedH = native.Height;
+                nestedHow = "native-slot";
+                insetL = insetT = insetR = insetB = 0;
+                haveInsets = true;
+                surfaceNeedsCalibration = false;
+                keepInPlaceWhileHidden = !show;
+                RememberOwner();
+                HostInEditor(new(native.Parent, 0, 0, native.Width, native.Height, "native-slot"), reveal || !show);
+                Visible = show;
+                if (resized) pendingViewLayout = true;
+                if (!show) ShowWindow(Handle, SwHide);
+                else if (Object is not null && (resized || reveal)) RevealAfterLayout();
+                else ShowWindow(Handle, SwShowNoActivate);
+                return;
+            }
             if (!show)
             {
                 keepInPlaceWhileHidden = true;
@@ -1305,9 +1433,15 @@ internal static class OleDocumentHost
                     pendingCssH = height;
                     var physW = WebviewSurface.PhysicalFromCss(width, PixelRatio);
                     var physH = WebviewSurface.PhysicalFromCss(height, PixelRatio);
-                    NativeWindow.GetWindowRect(Handle, out var hidden);
-                    NativeWindow.SetWindowPos(Handle, IntPtr.Zero, hidden.Left, hidden.Top, physW, physH,
-                        SwpNoActivate | SwpNoZOrder | SwpHideWindow);
+                    if (NativeWindow.IsChildHosted(Handle, nestedOwner))
+                        NativeWindow.SetWindowPos(Handle, IntPtr.Zero, nestedX, nestedY, physW, physH,
+                            SwpNoActivate | SwpNoZOrder | SwpHideWindow);
+                    else
+                    {
+                        NativeWindow.GetWindowRect(Handle, out var hidden);
+                        NativeWindow.SetWindowPos(Handle, IntPtr.Zero, hidden.Left, hidden.Top, physW, physH,
+                            SwpNoActivate | SwpNoZOrder | SwpHideWindow);
+                    }
                 }
                 // Hiding a tab that already has OLE must not resize to CSS or
                 // move to the desktop origin. Preserve the calibrated anchor.
@@ -1335,42 +1469,49 @@ internal static class OleDocumentHost
             {
                 WebviewSurface.Placement surface;
                 var follow = haveInsets && nestedOwner != IntPtr.Zero && NativeWindow.IsWindow(nestedOwner)
+                    && !WebviewSurface.IsGpuSurface(nestedOwner)
                     && WebviewSurface.IsTrustedHow(nestedHow);
                 var prevW = nestedW;
                 var prevH = nestedH;
                 if (follow)
                 {
-                    NativeWindow.GetWindowRect(nestedOwner, out var ownerNow);
-                    var ownerResized = ownerNow.Right - ownerNow.Left != lastOwnerW || ownerNow.Bottom - ownerNow.Top != lastOwnerH
+                    if (!NativeWindow.GetClientRect(nestedOwner, out var clientNow))
+                    {
+                        Visible = false;
+                        ShowWindow(Handle, SwHide);
+                        if (Object is null)
+                            throw new CoreFault("invalid_host_window", "The editor tab surface is unavailable.");
+                        return;
+                    }
+                    var ownerClient = WebviewSurface.ClientOrigin(clientNow.Right - clientNow.Left, clientNow.Bottom - clientNow.Top);
+                    var ownerResized = ownerClient.Width != lastClientW || ownerClient.Height != lastClientH
                         || NativeWindow.GetDpiForWindow(nestedOwner) != ownerDpi;
-                    var followed = WebviewSurface.ApplyOwnerInsets(WebviewSurface.Bounds(ownerNow), insetL, insetT, insetR, insetB);
+                    var followed = WebviewSurface.ApplyOwnerInsets(ownerClient, insetL, insetT, insetR, insetB);
                     nestedX = followed.X; nestedY = followed.Y;
                     nestedW = followed.Width; nestedH = followed.Height;
-                    RememberOwner(ownerNow);
+                    RememberOwner();
                     surface = new WebviewSurface.Placement(nestedOwner, nestedX, nestedY, nestedW, nestedH, nestedHow);
                     // Revealing a hidden tab must not consume a half-laid-out beacon
                     // union: it sits closer to the owner origin for a few frames.
                     if (!becomingVisible && (ownerResized || CssDiffersFromNested() || surfaceNeedsCalibration))
                     {
                         var refreshed = WebviewSurface.TryRefresh(token, pendingCssW, pendingCssH, PixelRatio);
-                        if (refreshed is not null && refreshed.Value.Parent == nestedOwner
-                            && !WebviewSurface.ShiftedTowardOwnerOrigin(WebviewSurface.Bounds(ownerNow),
-                                followed, new(refreshed.Value.X, refreshed.Value.Y, refreshed.Value.Width, refreshed.Value.Height)))
-                        {
-                            AcceptBeacon(refreshed.Value);
-                            surface = refreshed.Value;
-                        }
+                        if (refreshed is not null
+                            && WebviewSurface.TryEditorContainer(refreshed.Value, out var container, out _, out _, out _, out _)
+                            && container == nestedOwner
+                            && BeaconDidNotJumpOrigin(refreshed.Value)
+                            && AcceptBeacon(refreshed.Value))
+                            surface = new WebviewSurface.Placement(nestedOwner, nestedX, nestedY, nestedW, nestedH, nestedHow);
                         else
-                        {
                             surfaceNeedsCalibration = true;
-                        }
                     }
                 }
                 else
                 {
                     var resolved = WebviewSurface.Resolve(token, resolveMs, width, height, PixelRatio);
                     if (resolved is null || !WebviewSurface.IsTrustedHow(resolved.Value.How)
-                        || !WebviewSurface.FitsEditor(resolved.Value, width, height, PixelRatio))
+                        || !WebviewSurface.FitsEditor(resolved.Value, width, height, PixelRatio)
+                        || !AcceptBeacon(resolved.Value))
                     {
                         Visible = false;
                         ShowWindow(Handle, SwHide);
@@ -1382,22 +1523,12 @@ internal static class OleDocumentHost
                             throw new CoreFault("invalid_host_window", "The editor tab surface is unavailable.");
                         return;
                     }
-                    AcceptBeacon(resolved.Value);
-                    surface = resolved.Value;
+                    surface = new WebviewSurface.Placement(nestedOwner, nestedX, nestedY, nestedW, nestedH, nestedHow);
                 }
-                if (!NativeWindow.IsOwnedBy(Handle, surface.Parent))
-                    NativeWindow.OwnPopup(Handle, surface.Parent, ShellCopy);
-                NativeWindow.GetWindowRect(Handle, out var before);
-                var same = Visible && NativeWindow.IsWindowVisible(Handle)
-                    && before.Left == surface.X && before.Top == surface.Y
-                    && (before.Right - before.Left) == surface.Width
-                    && (before.Bottom - before.Top) == surface.Height;
+                HostInEditor(surface, becomingVisible);
                 var sizeChanged = nestedW != prevW || nestedH != prevH;
                 var cssDiff = CssDiffersFromNested();
                 if (!becomingVisible) Visible = true;
-                var posFlags = SwpNoActivate | SwpNoZOrder | (becomingVisible ? SwpHideWindow : SwpShowWindow);
-                if (!same && !NativeWindow.SetWindowPos(Handle, IntPtr.Zero, surface.X, surface.Y, surface.Width, surface.Height, posFlags))
-                    throw new InvalidOperationException("Office layout failed.");
                 if (follow)
                 {
                     if (sizeChanged) pendingViewLayout = true;
@@ -1420,35 +1551,82 @@ internal static class OleDocumentHost
             pendingCssW >= 32 && pendingCssH >= 32
             && (Math.Abs(WebviewSurface.PhysicalFromCss(pendingCssW, PixelRatio) - nestedW) > 16
                 || Math.Abs(WebviewSurface.PhysicalFromCss(pendingCssH, PixelRatio) - nestedH) > 16);
-        private void RememberOwner(NativeRect owner)
+        private void RememberOwner()
         {
+            if (!NativeWindow.GetWindowRect(nestedOwner, out var owner)) return;
             ownerLeft = owner.Left;
             ownerTop = owner.Top;
             lastOwnerW = owner.Right - owner.Left;
             lastOwnerH = owner.Bottom - owner.Top;
+            if (NativeWindow.GetClientRect(nestedOwner, out var client))
+            {
+                lastClientW = client.Right - client.Left;
+                lastClientH = client.Bottom - client.Top;
+            }
             ownerDpi = NativeWindow.GetDpiForWindow(nestedOwner);
         }
-        private void AcceptBeacon(WebviewSurface.Placement surface)
+        private bool AcceptBeacon(WebviewSurface.Placement surface)
         {
-            nestedOwner = surface.Parent;
-            nestedX = surface.X;
-            nestedY = surface.Y;
-            nestedW = surface.Width;
-            nestedH = surface.Height;
+            if (!WebviewSurface.TryEditorContainer(surface, out var container, out var cx, out var cy, out var cw, out var ch))
+            {
+                // #region agent log
+                DebugNdjson.Probe("A", "OleSite.AcceptBeacon", "container_miss",
+                    new { how = surface.How, parent = WebviewSurface.ClassName(surface.Parent), w = surface.Width, h = surface.Height });
+                // #endregion
+                return false;
+            }
+            nestedOwner = container;
+            nestedX = cx;
+            nestedY = cy;
+            nestedW = cw;
+            nestedH = ch;
             nestedHow = surface.How;
-            NativeWindow.GetWindowRect(nestedOwner, out var owner);
-            RememberOwner(owner);
-            WebviewSurface.ReadOwnerInsets(WebviewSurface.Bounds(owner),
+            RememberOwner();
+            WebviewSurface.ReadOwnerInsets(WebviewSurface.ClientOrigin(lastClientW, lastClientH),
                 new(nestedX, nestedY, nestedW, nestedH), out insetL, out insetT, out insetR, out insetB);
             haveInsets = true;
             surfaceNeedsCalibration = false;
+            return true;
+        }
+        private void HostInEditor(WebviewSurface.Placement surface, bool becomingVisible)
+        {
+            if (!NativeWindow.IsChildHosted(Handle, surface.Parent))
+                NativeWindow.AdoptChild(Handle, surface.Parent);
+            NativeWindow.TryMapToClient(Handle, surface.Parent, out var bx, out var by, out var bw, out var bh);
+            var same = Visible && NativeWindow.IsWindowVisible(Handle)
+                && bx == surface.X && by == surface.Y && bw == surface.Width && bh == surface.Height;
+            var posFlags = SwpNoActivate | SwpNoZOrder | (becomingVisible ? SwpHideWindow : SwpShowWindow);
+            if (!same && !NativeWindow.SetWindowPos(Handle, IntPtr.Zero, surface.X, surface.Y, surface.Width, surface.Height, posFlags))
+                throw new InvalidOperationException("Office layout failed.");
+            var desc = NativeWindow.DescribeHost(Handle, surface.Parent);
+            NativeWindow.GetClientRect(surface.Parent, out var parentClient);
+            // #region agent log
+            DebugNdjson.Probe("A", "OleSite.HostInEditor", "contain",
+                new { cls = WebviewSurface.ClassName(surface.Parent), x = surface.X, y = surface.Y, w = surface.Width, h = surface.Height,
+                    parentW = parentClient.Right - parentClient.Left, parentH = parentClient.Bottom - parentClient.Top,
+                    gpu = WebviewSurface.IsGpuSurface(surface.Parent), child = desc.Child, parentMatch = desc.IsChildOfOwner, popup = desc.Popup });
+            // #endregion
+        }
+        private static WebviewSurface.ScreenBounds ScreenFromClient(IntPtr parent, int x, int y, int width, int height)
+        {
+            var origin = new NativeWindow.Point { X = x, Y = y };
+            NativeWindow.ClientToScreen(parent, ref origin);
+            return new(origin.X, origin.Y, width, height);
+        }
+        private bool BeaconDidNotJumpOrigin(WebviewSurface.Placement refreshed)
+        {
+            var ideRoot = NativeWindow.GetAncestor(nestedOwner, 2);
+            if (ideRoot == IntPtr.Zero || !NativeWindow.GetWindowRect(ideRoot, out var ide)) return false;
+            return !WebviewSurface.ShiftedTowardOwnerOrigin(WebviewSurface.Bounds(ide),
+                ScreenFromClient(nestedOwner, nestedX, nestedY, nestedW, nestedH),
+                new(refreshed.X, refreshed.Y, refreshed.Width, refreshed.Height));
         }
         private void UpdateOwnerTracking()
         {
-            if (disposed || Handle == IntPtr.Zero || nestedOwner == IntPtr.Zero || !haveInsets) return;
+            if (disposed || Handle == IntPtr.Zero || nestedOwner == IntPtr.Zero || !haveInsets || nestedHow == "native-slot") return;
             ownerTracker ??= NativeOwnerTracker.Create(nestedOwner, Handle, RequestOwnerCalibration);
             ownerTracker.Update(nestedOwner, Handle,
-                new(ownerLeft, ownerTop, lastOwnerW, lastOwnerH), new(nestedX, nestedY, nestedW, nestedH), Visible);
+                new(0, 0, lastClientW, lastClientH), new(nestedX, nestedY, nestedW, nestedH), Visible);
         }
         internal void ResetSurfaceAnchor()
         {
@@ -1462,14 +1640,15 @@ internal static class OleDocumentHost
         private bool CanRevealAtAnchor()
         {
             if (!Visible || disposed || !haveInsets || surfaceNeedsCalibration || nestedOwner == IntPtr.Zero
-                || !NativeWindow.IsWindow(nestedOwner)) return false;
+                || !NativeWindow.IsWindow(nestedOwner) || !NativeWindow.IsChildHosted(Handle, nestedOwner)) return false;
             using var physicalCoordinates = WebviewSurface.EnterPhysicalCoordinates();
-            if (!NativeWindow.GetWindowRect(nestedOwner, out var owner) || !NativeWindow.GetWindowRect(Handle, out var popup)
-                || owner.Right - owner.Left != lastOwnerW || owner.Bottom - owner.Top != lastOwnerH
-                || NativeWindow.GetDpiForWindow(nestedOwner) != ownerDpi) return false;
-            var expected = WebviewSurface.ApplyOwnerInsets(WebviewSurface.Bounds(owner), insetL, insetT, insetR, insetB);
-            return popup.Left == expected.X && popup.Top == expected.Y
-                && popup.Right - popup.Left == expected.Width && popup.Bottom - popup.Top == expected.Height;
+            if (!NativeWindow.GetClientRect(nestedOwner, out var client)
+                || NativeWindow.GetDpiForWindow(nestedOwner) != ownerDpi
+                || !NativeWindow.TryMapToClient(Handle, nestedOwner, out var x, out var y, out var w, out var h)) return false;
+            var expected = WebviewSurface.ApplyOwnerInsets(
+                WebviewSurface.ClientOrigin(client.Right - client.Left, client.Bottom - client.Top),
+                insetL, insetT, insetR, insetB);
+            return x == expected.X && y == expected.Y && w == expected.Width && h == expected.Height;
         }
         private void RequestOwnerCalibration(bool final)
         {
@@ -1512,7 +1691,9 @@ internal static class OleDocumentHost
             // Refresh the exact nodes retained at attachment. Never enumerate the
             // desktop or scan the accessibility tree in a move/resize path.
             var measured = WebviewSurface.TryRefresh(nestedToken, pendingCssW, pendingCssH, PixelRatio);
-            if (measured is null || measured.Value.Parent != nestedOwner)
+            if (measured is null
+                || !WebviewSurface.TryEditorContainer(measured.Value, out var container, out _, out _, out _, out _)
+                || container != nestedOwner)
             {
                 surfaceNeedsCalibration = true;
                 ownerTracker?.InvalidateAnchor();
@@ -1524,13 +1705,13 @@ internal static class OleDocumentHost
             }
             var previousWidth = nestedW;
             var previousHeight = nestedH;
-            AcceptBeacon(measured.Value);
+            if (!AcceptBeacon(measured.Value)) return;
             placing = true;
             try
             {
-                NativeWindow.GetWindowRect(Handle, out var before);
-                var same = NativeWindow.IsWindowVisible(Handle) && before.Left == nestedX && before.Top == nestedY
-                    && before.Right - before.Left == nestedW && before.Bottom - before.Top == nestedH;
+                NativeWindow.TryMapToClient(Handle, nestedOwner, out var bx, out var by, out var bw, out var bh);
+                var same = NativeWindow.IsWindowVisible(Handle) && bx == nestedX && by == nestedY
+                    && bw == nestedW && bh == nestedH;
                 if (!same && !NativeWindow.SetWindowPos(Handle, IntPtr.Zero, nestedX, nestedY, nestedW, nestedH,
                     SwpNoActivate | SwpShowWindow | SwpNoZOrder)) return;
                 var resized = previousWidth != nestedW || previousHeight != nestedH;
@@ -1563,19 +1744,16 @@ internal static class OleDocumentHost
         private void RevealAfterLayout()
         {
             ApplyViewLayout();
+            FlushDocumentChrome(ViewportRect());
             RestoreUiActivation();
             RedrawWindow(Handle, IntPtr.Zero, IntPtr.Zero, RdwInvalidate | RdwUpdatenow | RdwAllChildren);
             if (ViewHandle != IntPtr.Zero)
                 RedrawWindow(ViewHandle, IntPtr.Zero, IntPtr.Zero, RdwInvalidate | RdwUpdatenow | RdwAllChildren);
             NativeWindow.PumpWait(15);
-            var frame = ClientRect();
             Visible = true;
             ShowWindow(Handle, SwShowNoActivate);
+            FlushDocumentChrome(ViewportRect(), probe: true);
             UpdateOwnerTracking();
-            // #region agent log
-            DebugNdjson.Probe("D", "OleDocumentSite.RevealAfterLayout", "reveal",
-                new { w = frame.Right - frame.Left, h = frame.Bottom - frame.Top });
-            // #endregion
         }
         internal void ActivateInPlace()
         {
@@ -1586,25 +1764,17 @@ internal static class OleDocumentHost
             var isInplace = Object is IOleInPlaceObject;
             if (!isDoc && !isInplace)
                 throw new CoreFault("ole_embed_failed", "This Office file cannot be hosted in the editor tab.");
-            var verbAt = Environment.TickCount64;
-            int inplace = Object.DoVerb(OleIverbInPlaceActivate, IntPtr.Zero, this, 0, Handle, ref rect);
-            int verb = OleIverbInPlaceActivate;
-            int hr = inplace;
-            if (inplace != SOk)
+            int shown = Object.DoVerb(OleIverbShow, IntPtr.Zero, this, 0, Handle, ref rect);
+            int hr = shown;
+            if (shown != SOk)
             {
-                verb = OleIverbShow;
-                hr = Object.DoVerb(OleIverbShow, IntPtr.Zero, this, 0, Handle, ref rect);
+                hr = Object.DoVerb(OleIverbPrimary, IntPtr.Zero, this, 0, Handle, ref rect);
                 if (hr != SOk)
                 {
-                    verb = OleIverbPrimary;
-                    hr = Object.DoVerb(OleIverbPrimary, IntPtr.Zero, this, 0, Handle, ref rect);
-                    if (hr != SOk && !isDoc) Marshal.ThrowExceptionForHR(inplace);
+                    hr = Object.DoVerb(OleIverbInPlaceActivate, IntPtr.Zero, this, 0, Handle, ref rect);
+                    if (hr != SOk && !isDoc) Marshal.ThrowExceptionForHR(shown);
                 }
             }
-            // #region agent log
-            DebugNdjson.Probe("H", "OleSite.ActivateInPlace", "verb",
-                new { verb, hr, elapsedMs = Environment.TickCount64 - verbAt });
-            // #endregion
             if (!viewActivated) CompleteActivation();
             if (!TryBindViewHandle())
                 throw new InvalidOperationException("The Office view is not hosted in the native container.");
@@ -1752,11 +1922,8 @@ internal static class OleDocumentHost
         {
             if (msg == WmErasebkgnd)
             {
-                if (!ShellCopy && documentView is null)
-                {
-                    NativeWindow.GetClientRect(hwnd, out var client);
-                    FillRect(wParam, ref client, GetStockObject(WhiteBrush));
-                }
+                NativeWindow.GetClientRect(hwnd, out var client);
+                FillRect(wParam, ref client, GetStockObject(WhiteBrush));
                 return (IntPtr)1;
             }
             if (ShellCopy && msg == WmPaint)
@@ -1766,8 +1933,6 @@ internal static class OleDocumentHost
             }
             if (msg == WmSize && !ShellCopy && !placing)
                 QueueViewLayout();
-            if (msg == WmActivate)
-                return NativeWindow.DefWindowProc(hwnd, msg, wParam, lParam);
             return NativeWindow.DefWindowProc(hwnd, msg, wParam, lParam);
         }
         private void PaintSharedCopy(IntPtr hwnd)
@@ -1843,7 +2008,7 @@ internal static class OleDocumentHost
                 var current = new FileInfo(DocumentPath);
                 if (!current.Exists || current.IsReadOnly)
                     throw new CoreFault("document_conflict", "The source file is missing or read-only.");
-                if (sourceLength > 0 && current.Length != sourceLength && current.LastWriteTimeUtc.Ticks != sourceLastWrite)
+                if (sourceLength > 0 && (current.Length != sourceLength || current.LastWriteTimeUtc.Ticks != sourceLastWrite))
                     throw new CoreFault("document_conflict", "The source file changed outside this session.");
                 file.Save(DocumentPath, true);
                 try { file.SaveCompleted(DocumentPath); } catch { /* Some servers omit SaveCompleted. */ }
@@ -2408,8 +2573,6 @@ internal static class OleDocumentHost
 
     private static void HideNewFrames(List<IntPtr> existing, IntPtr host, HashSet<uint> protectPids)
     {
-        var hidden = 0;
-        var hiddenNames = new List<string>();
         var names = new Dictionary<uint, string>();
         NativeWindow.EnumProc callback = (window, _) =>
         {
@@ -2421,7 +2584,10 @@ internal static class OleDocumentHost
             NativeWindow.GetWindowThreadProcessId(window, out var pid);
             if (pid == 0 || protectPids.Contains(pid)) return true;
             var className = WebviewSurface.ClassName(window);
-            if (className is "#32770" or "NUIDialog"
+            // Office owns its transient UI. A class name/PID does not prove that
+            // a ribbon or flyout belongs to this document; never reparent it.
+            if (OfficeUiPolicy.IsTransientUi(className)) return true;
+            if (className is "#32770"
                 || className.StartsWith("bosa_sdm", StringComparison.OrdinalIgnoreCase)
                 || className.Contains("Dialog", StringComparison.OrdinalIgnoreCase)
                 || className.StartsWith("Chrome_", StringComparison.OrdinalIgnoreCase))
@@ -2439,16 +2605,10 @@ internal static class OleDocumentHost
             }
             if (!OfficeServerNames.Contains(processName)) return true;
             ShowWindow(window, SwHide);
-            hidden++;
-            if (hiddenNames.Count < 8) hiddenNames.Add(processName + ":" + className);
             return true;
         };
         NativeWindow.EnumWindows(callback, IntPtr.Zero);
         GC.KeepAlive(callback);
-        // #region agent log
-        DebugNdjson.Probe("A", "OleDocumentHost.HideNewFrames", hidden == 0 ? "none" : "hid",
-            new { hidden, names = hiddenNames });
-        // #endregion
     }
 
     private static void SweepNewFrames(List<IntPtr> existing, IntPtr host, HashSet<uint> protectPids)
@@ -2501,8 +2661,13 @@ internal static class NativeWindow
     [DllImport("user32.dll")] internal static extern IntPtr GetWindow(IntPtr hwnd, uint command);
     [DllImport("user32.dll")] internal static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
     [DllImport("user32.dll")] internal static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] private static extern IntPtr WindowFromPoint(Point point);
+    internal static IntPtr WindowFromPoint(int x, int y) => WindowFromPoint(new Point { X = x, Y = y });
     [DllImport("user32.dll")] internal static extern int GetSystemMetrics(int index);
     [DllImport("user32.dll")] internal static extern uint GetDpiForWindow(IntPtr hwnd);
+    [DllImport("user32.dll")] private static extern IntPtr GetWindowDpiAwarenessContext(IntPtr hwnd);
+    [DllImport("user32.dll")] private static extern IntPtr SetThreadDpiAwarenessContext(IntPtr value);
+    [DllImport("user32.dll")] private static extern bool AreDpiAwarenessContextsEqual(IntPtr first, IntPtr second);
     [DllImport("user32.dll", SetLastError = true)] internal static extern IntPtr SetParent(IntPtr child, IntPtr parent);
     [DllImport("user32.dll")] internal static extern int GetWindowLong(IntPtr hwnd, int index);
     [DllImport("user32.dll")] internal static extern int SetWindowLong(IntPtr hwnd, int index, int value);
@@ -2510,12 +2675,26 @@ internal static class NativeWindow
     [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW")] internal static extern IntPtr SetWindowLongPtr(IntPtr hwnd, int index, IntPtr value);
     [DllImport("user32.dll")] internal static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
     [DllImport("user32.dll")] internal static extern bool ClientToScreen(IntPtr hwnd, ref Point point);
+    [DllImport("user32.dll")] internal static extern bool ScreenToClient(IntPtr hwnd, ref Point point);
     [DllImport("user32.dll")] private static extern bool SetProcessDpiAwarenessContext(IntPtr value);
     [StructLayout(LayoutKind.Sequential)]
     internal struct Point { public int X, Y; }
     internal static void TryEnableDpi()
     {
         try { SetProcessDpiAwarenessContext(new IntPtr(-4)); } catch { }
+    }
+    internal static IDisposable EnterWindowDpi(IntPtr window) => new WindowDpiScope(window);
+
+    private sealed class WindowDpiScope : IDisposable
+    {
+        private readonly IntPtr previous;
+        internal WindowDpiScope(IntPtr window)
+        {
+            var context = GetWindowDpiAwarenessContext(window);
+            previous = context == IntPtr.Zero ? IntPtr.Zero : SetThreadDpiAwarenessContext(context);
+            if (previous == IntPtr.Zero) throw new CoreFault("native_dpi_context", "Could not match the editor slot DPI context.");
+        }
+        public void Dispose() => SetThreadDpiAwarenessContext(previous);
     }
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] internal static extern IntPtr DefWindowProc(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] internal static extern bool UnregisterClass(string className, IntPtr instance);
@@ -2567,33 +2746,64 @@ internal static class NativeWindow
             owner != IntPtr.Zero && IsChild(owner, hwnd));
     }
 
-    internal static bool IsOwnedBy(IntPtr popup, IntPtr owner) =>
-        popup != IntPtr.Zero && owner != IntPtr.Zero && GetWindowLongPtr(popup, GwlpHwndParent) == owner;
+    internal static bool IsChildHosted(IntPtr child, IntPtr parent) =>
+        child != IntPtr.Zero && parent != IntPtr.Zero
+        && GetParent(child) == parent
+        && (GetWindowLong(child, GwlStyle) & WsChild) != 0;
 
-    internal static void OwnPopup(IntPtr popup, IntPtr owner, bool noActivate = false)
+    internal static bool TryMapToClient(IntPtr hwnd, IntPtr parent, out int x, out int y, out int width, out int height)
     {
-        if (popup == IntPtr.Zero || owner == IntPtr.Zero) throw new InvalidOperationException("Office layout failed.");
-        if (GetParent(popup) != IntPtr.Zero) SetParent(popup, IntPtr.Zero);
-        var style = GetWindowLong(popup, GwlStyle);
-        SetWindowLong(popup, GwlStyle, (style & ~WsChild) | WsPopupStyle | WsClipSiblings | WsClipChildrenStyle);
-        var ex = GetWindowLong(popup, GwlExStyle) | WsExToolwindow;
-        if (noActivate) ex |= WsExNoActivate;
-        else ex &= ~WsExNoActivate;
-        SetWindowLong(popup, GwlExStyle, ex);
-        SetWindowPos(popup, IntPtr.Zero, 0, 0, 0, 0, SwpNoMove | SwpNoSize | SwpNoZOrder | SwpNoActivate | SwpFrameChanged);
-        SetWindowLongPtr(popup, GwlpHwndParent, owner);
+        x = y = width = height = 0;
+        if (!GetWindowRect(hwnd, out var wr)) return false;
+        var origin = new Point { X = wr.Left, Y = wr.Top };
+        if (parent != IntPtr.Zero && !ScreenToClient(parent, ref origin)) return false;
+        x = origin.X;
+        y = origin.Y;
+        width = wr.Right - wr.Left;
+        height = wr.Bottom - wr.Top;
+        return width > 0 && height > 0;
     }
+
+    private static readonly IntPtr HwndBottom = new(1);
+    internal static void SendToBack(IntPtr hwnd) =>
+        SetWindowPos(hwnd, HwndBottom, 0, 0, 0, 0, SwpNoMove | SwpNoSize | SwpNoActivate);
 
     internal static void AdoptChild(IntPtr child, IntPtr parent)
     {
-        if (child == IntPtr.Zero || parent == IntPtr.Zero) throw new InvalidOperationException("Office layout failed.");
+        if (child == IntPtr.Zero || parent == IntPtr.Zero || child == parent || !IsWindow(child) || !IsWindow(parent)
+            || IsChild(child, parent)
+            || GetWindowThreadProcessId(child, out var process) == 0 || process != (uint)Environment.ProcessId)
+            throw new InvalidOperationException("Only a live Core-owned container can be attached.");
+        var childContext = GetWindowDpiAwarenessContext(child);
+        var parentContext = GetWindowDpiAwarenessContext(parent);
+        if (childContext == IntPtr.Zero || parentContext == IntPtr.Zero || !AreDpiAwarenessContextsEqual(childContext, parentContext))
+            throw new InvalidOperationException("The editor and native host require matching DPI contexts.");
+        var previousParent = GetParent(child);
         var style = GetWindowLong(child, GwlStyle);
-        SetWindowLong(child, GwlStyle, (style & ~WsPopupStyle) | WsChild | WsClipSiblings | WsClipChildrenStyle);
         var ex = GetWindowLong(child, GwlExStyle);
-        SetWindowLong(child, GwlExStyle, ex & ~WsExToolwindow & ~WsExNoActivate);
-        SetWindowPos(child, IntPtr.Zero, 0, 0, 0, 0, SwpNoMove | SwpNoSize | SwpNoZOrder | SwpNoActivate | SwpFrameChanged);
-        SetParent(child, parent);
-        if (GetParent(child) != parent) throw new InvalidOperationException("Office layout failed.");
+        try
+        {
+            SetWindowLong(child, GwlStyle, (style & ~WsPopupStyle) | WsChild | WsClipSiblings | WsClipChildrenStyle);
+            SetWindowLong(child, GwlExStyle, ex & ~WsExToolwindow & ~WsExNoActivate);
+            Marshal.SetLastPInvokeError(0);
+            SetParent(child, parent);
+            if (Marshal.GetLastPInvokeError() != 0 || !IsChildHosted(child, parent)
+                || (GetWindowLong(child, GwlStyle) & WsPopupStyle) != 0)
+                throw new InvalidOperationException("Office layout failed.");
+            if (!SetWindowPos(child, IntPtr.Zero, 0, 0, 0, 0,
+                SwpNoMove | SwpNoSize | SwpNoZOrder | SwpNoActivate | SwpFrameChanged))
+                throw new InvalidOperationException("Office layout failed.");
+        }
+        catch
+        {
+            // Roll back only the private container; never rewrite Office or IDE styles.
+            SetParent(child, previousParent);
+            SetWindowLong(child, GwlStyle, style);
+            SetWindowLong(child, GwlExStyle, ex);
+            SetWindowPos(child, IntPtr.Zero, 0, 0, 0, 0,
+                SwpNoMove | SwpNoSize | SwpNoZOrder | SwpNoActivate | SwpFrameChanged);
+            throw;
+        }
     }
 
     [DllImport("user32.dll")] private static extern bool PeekMessage(out NativeMessage msg, IntPtr hwnd, uint min, uint max, uint remove);

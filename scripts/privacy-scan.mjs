@@ -27,16 +27,25 @@ export async function scanRepository(root = process.cwd()) {
   const names = execFileSync('git', ['ls-files', '--cached', '--others', '--exclude-standard', '-z'], { cwd: root, encoding: 'utf8', windowsHide: true })
     .split('\0').filter(Boolean);
   const failures = [];
+  let fileCount = 0;
   const personalRoots = [root, os.homedir(), process.env.USERPROFILE, process.env.LOCALAPPDATA].filter(Boolean);
   for (const name of new Set(names)) {
-    const bytes = await readFile(path.join(root, name));
+    let bytes;
+    try { bytes = await readFile(path.join(root, name)); }
+    catch (error) {
+      // Git's index still lists tracked files deleted from the working tree.
+      // Missing files contain nothing to scan; other read failures stay fatal.
+      if (error?.code === 'ENOENT') continue;
+      throw error;
+    }
+    fileCount++;
     if (bytes.includes(0)) {
       if (!/\.(?:gif|png|jpe?g|webp|ico)$/i.test(name)) failures.push({ file: name, rule: 'unexpected-tracked-binary', line: 1 });
       continue;
     }
     for (const finding of inspectText(bytes.toString('utf8'), personalRoots)) failures.push({ file: name, ...finding });
   }
-  return { fileCount: new Set(names).size, failures };
+  return { fileCount, failures };
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))) {
