@@ -1,0 +1,197 @@
+diff --git a/package.json b/package.json
+index 3b709ca..e983bff 100644
+--- a/package.json
++++ b/package.json
+@@ -64,6 +64,19 @@
+           "default": "auto",
+           "description": "How an Office document is shown in its editor tab. Applies to tabs opened after the change."
+         },
++        "officeInEditor.chatTarget": {
++          "type": "string",
++          "enum": [
++            "auto",
++            "builtin"
++          ],
++          "enumDescriptions": [
++            "Use the DeepSeek Harness chat when its extension is installed, otherwise the editor's own chat.",
++            "Always use the editor's own chat (Cursor composer or VS Code chat)."
++          ],
++          "default": "auto",
++          "description": "Where Add to Chat places a selected Office reference."
++        },
+         "officeInEditor.pixelPolicy": {
+           "type": "string",
+           "enum": [
+diff --git a/packages/adapters/vsix/src/extension.ts b/packages/adapters/vsix/src/extension.ts
+index bc08a2c..f3f5194 100644
+--- a/packages/adapters/vsix/src/extension.ts
++++ b/packages/adapters/vsix/src/extension.ts
+@@ -21,6 +21,7 @@ import { openOfficeLabPage } from "./office-page-lab";
+ import { FOCUS_EXTENSIONS, FocusEditor, newSurfaceToken } from "./focus-editor";
+ import { FocusStreamClient } from "./focus-stream";
+ import { FOCUS_TEXT, focusHtml } from "./focus-ui";
++import { HarnessChat, harnessTarget } from "./harness-chat";
+ 
+ const REF_ID = /^(?:[a-f0-9]{32}|[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})$/iu;
+ const DOCUMENT_EXTENSIONS = new Set([
+@@ -95,6 +96,7 @@ class OfficeExtension implements vscode.Disposable {
+   private readonly broker: OfficeBroker;
+   private readonly mcp: McpRegistration;
+   private readonly output = vscode.window.createOutputChannel("Office In Editor");
++  private readonly harnessChat: HarnessChat;
+   private readonly hostId = hostKind() + ":" + randomUUID();
+   private readonly panels = new Map<string, vscode.WebviewPanel>();
+   private readonly officeClosers = new Set<() => Promise<void>>();
+@@ -129,7 +131,10 @@ class OfficeExtension implements vscode.Disposable {
+       treeDataProvider: this.tree,
+       showCollapseAll: false,
+     });
+-    context.subscriptions.push(this.tree, this.view, this.output, this.mcp);
++    this.harnessChat = new HarnessChat(context.globalStorageUri, stage => {
++      if (++this.traceEvents <= 1024) this.output.appendLine(`chat stage=${stage}`);
++    });
++    context.subscriptions.push(this.tree, this.view, this.output, this.mcp, this.harnessChat);
+     void vscode.commands.executeCommand("setContext", "officeInEditor.ackAlertsOn", this.ackAlertsEnabled());
+     const commands: Record<string, (argument?: unknown) => Promise<unknown>> = {
+       refresh: () => this.refresh(),
+@@ -250,6 +255,8 @@ class OfficeExtension implements vscode.Disposable {
+ 
+   private async presentInChat(documentName: string, text: string): Promise<boolean> {
+     const query = documentName + "\n\n" + text;
++    const harness = harnessTarget();
++    if (harness && await this.harnessChat.place(harness, documentName, query)) return true;
+     const cursor = hostKind() === "cursor";
+     let placed = false;
+     let used = "";
+diff --git a/packages/adapters/vsix/src/harness-chat.ts b/packages/adapters/vsix/src/harness-chat.ts
+new file mode 100644
+index 0000000..2206c23
+--- /dev/null
++++ b/packages/adapters/vsix/src/harness-chat.ts
+@@ -0,0 +1,126 @@
++import * as vscode from "vscode";
++
++/**
++ * Add to Chat delivery into DeepSeek Harness chat extensions.
++ *
++ * Neither extension exposes an API for other extensions, so delivery uses only
++ * what each one already does for its own users:
++ * - skymecode.deepseek-harness-for-vscode attaches the active text editor's
++ *   selection to its composer (setting deepseekHarness.autoAttachSelection,
++ *   default on). The reference is shown in a read-only editor and selected.
++ * - lucasliang.harness-connector-deepseek (pwhMass/deepseek-harness-vscode)
++ *   inserts an @ mention through its public command deepseekHarness.addFileToChat.
++ *   The reference is written to a file the Harness host can read.
++ */
++
++export type HarnessKind = "skymecode" | "connector";
++
++const SKYMECODE_ID = "skymecode.deepseek-harness-for-vscode";
++const CONNECTOR_ID = "lucasliang.harness-connector-deepseek";
++const SKYMECODE_VIEW = "deepseekHarness.chatView";
++const CONNECTOR_VIEW = "deepseekHarness.sessionView";
++const REFERENCE_SCHEME = "office-in-editor-ref";
++const KEEP_REFERENCES = 12;
++
++export function harnessTarget(): HarnessKind | undefined {
++  const setting = vscode.workspace.getConfiguration("officeInEditor").get<string>("chatTarget", "auto");
++  if (setting === "builtin") return undefined;
++  if (vscode.extensions.getExtension(SKYMECODE_ID)) return "skymecode";
++  if (vscode.extensions.getExtension(CONNECTOR_ID)) return "connector";
++  return undefined;
++}
++
++function safeName(value: string): string {
++  const name = value.replace(/[\u0000-\u001f\u007f"*/:<>?\\|]/gu, "_").replace(/\s+/gu, " ").trim().slice(0, 80);
++  return name === "" ? "Office" : name;
++}
++
++export class HarnessChat implements vscode.Disposable {
++  private readonly contents = new Map<string, string>();
++  private readonly registration: vscode.Disposable;
++  private counter = 0;
++  private connectorViewShown = false;
++
++  constructor(private readonly storage: vscode.Uri, private readonly trace: (stage: string) => void) {
++    this.registration = vscode.workspace.registerTextDocumentContentProvider(REFERENCE_SCHEME, {
++      provideTextDocumentContent: uri => this.contents.get(uri.toString()) ?? "",
++    });
++  }
++
++  async place(kind: HarnessKind, documentName: string, text: string): Promise<boolean> {
++    try {
++      const placed = kind === "skymecode"
++        ? await this.placeSkymecode(documentName, text)
++        : await this.placeConnector(documentName, text);
++      this.trace(kind + (placed ? "_placed" : "_not_placed"));
++      return placed;
++    } catch {
++      this.trace(kind + "_failed");
++      return false;
++    }
++  }
++
++  private async placeSkymecode(documentName: string, text: string): Promise<boolean> {
++    const uri = vscode.Uri.from({
++      scheme: REFERENCE_SCHEME,
++      path: "/" + safeName(documentName) + " 选区.md",
++      query: String(++this.counter),
++    });
++    this.contents.set(uri.toString(), text);
++    while (this.contents.size > KEEP_REFERENCES) {
++      const oldest = this.contents.keys().next().value;
++      if (oldest === undefined) break;
++      this.contents.delete(oldest);
++    }
++    const document = await vscode.workspace.openTextDocument(uri);
++    const editor = await vscode.window.showTextDocument(document, { preview: true, preserveFocus: false });
++    const end = document.lineAt(document.lineCount - 1).range.end;
++    editor.selection = new vscode.Selection(new vscode.Position(0, 0), end);
++    editor.revealRange(new vscode.Range(0, 0, 0, 0));
++    this.trace("skymecode_selection_set");
++    // The chat keeps its page alive once shown; on first show it reads the
++    // current selection when its page reports ready.
++    await vscode.commands.executeCommand(SKYMECODE_VIEW + ".focus");
++    this.trace("skymecode_view_focused");
++    return true;
++  }
++
++  private async placeConnector(documentName: string, text: string): Promise<boolean> {
++    const folder = vscode.Uri.joinPath(this.storage, "chat-refs");
++    await vscode.workspace.fs.createDirectory(folder);
++    const stamp = Date.now().toString(36) + (++this.counter).toString(36);
++    const file = vscode.Uri.joinPath(folder, safeName(documentName).replace(/\s/gu, "_") + "-" + stamp + ".md");
++    await vscode.workspace.fs.writeFile(file, new TextEncoder().encode(text));
++    await this.pruneConnector(folder);
++    await vscode.commands.executeCommand(CONNECTOR_VIEW + ".focus");
++    this.trace("connector_view_focused");
++    // Its page drops messages posted before it loads; after the first show it
++    // is retained while hidden.
++    if (!this.connectorViewShown) await new Promise(resolve => setTimeout(resolve, 1_500));
++    this.connectorViewShown = true;
++    await vscode.commands.executeCommand("deepseekHarness.addFileToChat", file);
++    return true;
++  }
++
++  private async pruneConnector(folder: vscode.Uri): Promise<void> {
++    try {
++      const files = (await vscode.workspace.fs.readDirectory(folder))
++        .filter(([name, type]) => type === vscode.FileType.File && name.endsWith(".md"))
++        .map(([name]) => name);
++      if (files.length <= KEEP_REFERENCES) return;
++      const stamps = await Promise.all(files.map(async name => {
++        const uri = vscode.Uri.joinPath(folder, name);
++        return { uri, mtime: (await vscode.workspace.fs.stat(uri)).mtime };
++      }));
++      stamps.sort((a, b) => b.mtime - a.mtime);
++      for (const stale of stamps.slice(KEEP_REFERENCES)) {
++        try { await vscode.workspace.fs.delete(stale.uri); } catch { /* still referenced by an open chat */ }
++      }
++    } catch { /* pruning is best effort */ }
++  }
++
++  dispose(): void {
++    this.registration.dispose();
++    this.contents.clear();
++  }
++}

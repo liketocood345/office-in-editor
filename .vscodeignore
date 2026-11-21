@@ -22,3 +22,4 @@ docs/**
 AGENTS.md
 .gitignore
 planning/**
+patches/**

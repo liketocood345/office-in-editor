@@ -57,6 +57,10 @@ Core 负责文档身份、MCP 服务、修改记录和恢复，并负责调度�
 - 只投递给已经登记过的聊天，找不到目标时不做任何事；
 - 引用是只读快照，不会修改或保存文档。
 
+### 可选补丁：DeepSeek Harness 聊天
+
+[`patches/dsh-add-to-chat`](patches/dsh-add-to-chat) 是一份可选补丁，打上后 Add to Chat 会投递到 DeepSeek Harness 的 VS Code 扩展（skymecode 版或 pwhMass 版）的聊天框。原理、用法和验证情况见补丁目录里的说明。
+
 ## 安装
 
 ### 从 Release 安装
@@ -109,6 +113,7 @@ npm run package:vsix
 | `packages/contracts` | 插件、Core 与加载项之间的消息约定 |
 | `apps/mcp-app` | 在聊天里展示引用的 MCP 页面 |
 | `scripts` | 构建、打包、安装与卸载脚本 |
+| `patches` | 不进主线的可选补丁 |
 
 ## 隐私
 
