@@ -1,0 +1,277 @@
+{
+  "name": "office-in-editor",
+  "displayName": "Office in Editor",
+  "description": "Open Microsoft Office documents, spreadsheets and presentations in VS Code and Cursor tabs, with Office MCP for AI edits and Add to Chat.",
+  "version": "0.1.4",
+  "publisher": "liketocood345",
+  "license": "SEE LICENSE IN LICENSE",
+  "private": true,
+  "preview": true,
+  "engines": {
+    "vscode": "^1.120.0"
+  },
+  "extensionKind": [
+    "ui"
+  ],
+  "categories": [
+    "Other",
+    "Machine Learning"
+  ],
+  "keywords": [
+    "productivity",
+    "office",
+    "word",
+    "excel",
+    "powerpoint",
+    "mcp",
+    "cursor"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/liketocood345/office-in-editor.git"
+  },
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onView:officeInEditor.inbox",
+    "onCustomEditor:officeInEditor.document",
+    "onMcpServerDefinitionProvider:office-in-editor"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "Office control requires a trusted local workspace."
+    },
+    "virtualWorkspaces": {
+      "supported": false
+    }
+  },
+  "contributes": {
+    "configuration": {
+      "title": "Office in Editor",
+      "properties": {
+        "officeInEditor.hostRoute": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "focus",
+            "ole"
+          ],
+          "enumDescriptions": [
+            "Word, Excel and PowerPoint use the focus-hybrid route when the installed Core supports it; other formats use the in-place OLE route.",
+            "Always use the focus-hybrid route for Word, Excel and PowerPoint.",
+            "Always use the in-place OLE route."
+          ],
+          "default": "auto",
+          "description": "How an Office document is shown in its editor tab. Applies to tabs opened after the change."
+        },
+        "officeInEditor.pixelPolicy": {
+          "type": "string",
+          "enum": [
+            "always",
+            "switch",
+            "mouse"
+          ],
+          "enumDescriptions": [
+            "Keep capture warm while editing, for the fastest switch back to the preview.",
+            "Start capture only when Office leaves the foreground.",
+            "Start capture once the pointer moves while editing."
+          ],
+          "default": "always",
+          "description": "When the focus-hybrid route prepares the preview of a parked Office window."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "officeInEditor.refresh",
+        "title": "Office: Refresh References"
+      },
+      {
+        "command": "officeInEditor.status",
+        "title": "Office: Show Bridge Status"
+      },
+      {
+        "command": "officeInEditor.diagnostics",
+        "title": "Office: Show Redacted Diagnostics"
+      },
+      {
+        "command": "officeInEditor.openDocument",
+        "title": "Office: Open Document Session"
+      },
+      {
+        "command": "officeInEditor.openInOffice",
+        "title": "Office: Open in Microsoft Office"
+      },
+      {
+        "command": "officeInEditor.realignWindow",
+        "title": "Office: Re-align Embedded Window"
+      },
+      {
+        "command": "officeInEditor.listOfficeInstances",
+        "title": "Office: List Connected Applications"
+      },
+      {
+        "command": "officeInEditor.captureSelection",
+        "title": "Office: Capture Current Selection"
+      },
+      {
+        "command": "officeInEditor.listRegisteredChats",
+        "title": "Office: Choose Registered Chat"
+      },
+      {
+        "command": "officeInEditor.deliverReference",
+        "title": "Office: Add Reference to Registered Chat"
+      },
+      {
+        "command": "officeInEditor.releaseReference",
+        "title": "Office: Release Reference"
+      },
+      {
+        "command": "officeInEditor.exportReference",
+        "title": "Office: Export Reference"
+      },
+      {
+        "command": "officeInEditor.showReference",
+        "title": "Office: Show Reference"
+      },
+      {
+        "command": "officeInEditor.toggleAckAlerts",
+        "title": "自动确认警告",
+        "icon": "$(check)"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "officeInEditor",
+          "title": "Office",
+          "icon": "assets/office-in-editor.svg"
+        }
+      ]
+    },
+    "views": {
+      "officeInEditor": [
+        {
+          "id": "officeInEditor.inbox",
+          "name": "Office References"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "officeInEditor.refresh",
+          "when": "view == officeInEditor.inbox",
+          "group": "navigation"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "officeInEditor.toggleAckAlerts",
+          "when": "activeCustomEditorId == officeInEditor.document",
+          "group": "navigation"
+        }
+      ]
+    },
+    "mcpServerDefinitionProviders": [
+      {
+        "id": "office-in-editor",
+        "label": "Office in Editor"
+      }
+    ],
+    "customEditors": [
+      {
+        "viewType": "officeInEditor.document",
+        "displayName": "Office in Editor",
+        "selector": [
+          {
+            "filenamePattern": "*.docx"
+          },
+          {
+            "filenamePattern": "*.doc"
+          },
+          {
+            "filenamePattern": "*.docm"
+          },
+          {
+            "filenamePattern": "*.dotx"
+          },
+          {
+            "filenamePattern": "*.rtf"
+          },
+          {
+            "filenamePattern": "*.xlsx"
+          },
+          {
+            "filenamePattern": "*.xls"
+          },
+          {
+            "filenamePattern": "*.xlsm"
+          },
+          {
+            "filenamePattern": "*.xlsb"
+          },
+          {
+            "filenamePattern": "*.csv"
+          },
+          {
+            "filenamePattern": "*.pptx"
+          },
+          {
+            "filenamePattern": "*.ppt"
+          },
+          {
+            "filenamePattern": "*.pptm"
+          },
+          {
+            "filenamePattern": "*.vsdx"
+          },
+          {
+            "filenamePattern": "*.vsd"
+          },
+          {
+            "filenamePattern": "*.vstx"
+          },
+          {
+            "filenamePattern": "*.one"
+          },
+          {
+            "filenamePattern": "*.onepkg"
+          },
+          {
+            "filenamePattern": "*.pub"
+          },
+          {
+            "filenamePattern": "*.mpp"
+          }
+        ],
+        "priority": "default"
+      }
+    ],
+    "configurationDefaults": {
+      "files.exclude": {
+        "**/~$*": true
+      }
+    }
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit",
+    "package:vsix": "npm run build && vsce package --no-dependencies --allow-missing-repository --out artifacts/office-in-editor-0.1.4.vsix",
+    "package:setup": "node scripts/package-setup.mjs",
+    "vscode:prepublish": "node scripts/build-extension.mjs"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/ext-apps": "2.0.4",
+    "@types/node": "24.10.1",
+    "@types/vscode": "1.120.0",
+    "@vscode/vsce": "4.1.1",
+    "esbuild": "0.28.2",
+    "typescript": "5.9.3"
+  },
+  "overrides": {
+    "@vscode/vsce": {
+      "minimatch": "11.0.1"
+    }
+  }
+}
